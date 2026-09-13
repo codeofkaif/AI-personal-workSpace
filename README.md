@@ -287,7 +287,7 @@ The frontend should focus on presentation and user interaction. Authorization de
 
 ### Frontend LLD image
 
-Upload the previously created frontend LLD image separately and reference it here.
+![Frontend LLD](docs/architecture/frontEnd_design.png)
 
 ---
 
