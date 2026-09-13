@@ -2,13 +2,30 @@
 
 > **AI-powered personal workspace for college-scoped knowledge, private user knowledge, productivity, and source-grounded AI assistance.**
 
-## Project Status
+## 🚀 Project Status
 
-**Planning and architecture are complete. Implementation is starting.**
+**Current Phase:** 🟢 **Development Started**
 
-This repository documentation is intentionally separated from the architecture diagrams.
+The planning and architecture phase is now complete. The project's **HLD, LLD, database design, frontend architecture, backend architecture, and AI/RAG architecture** have been finalized.
 
-The **HLD and LLD diagrams are maintained as separate image assets** and should be uploaded alongside this README. Therefore, this README does **not** reproduce the complete HLD/LLD diagrams as text. Instead, it explains the purpose, decisions, responsibilities, data boundaries, workflows, and implementation plan around those diagrams.
+The project has now moved from **design → implementation**.
+
+### ✅ Architecture Complete
+- HLD finalized
+- Backend LLD finalized
+- AI/RAG LLD finalized
+- Database design finalized
+- Frontend LLD finalized
+- Technology stack finalized
+
+### 🔨 Development In Progress
+Implementation of the **Frontend, Spring Boot Backend, PostgreSQL Database, and AI/RAG Service** is now underway.
+
+### 🎯 Immediate Goal
+
+Build and integrate the first end-to-end working flow:
+
+**User → Frontend → Backend → AI/RAG → Database → Response**
 
 ---
 
@@ -687,48 +704,8 @@ pgvector + LLM
 
 ---
 
-# 18. GitHub Workflow
 
-Recommended branches:
-
-```text
-main
-│
-└── develop
-     │
-     ├── feature/frontend
-     ├── feature/backend
-     ├── feature/database
-     ├── feature/rag
-     └── feature/auth
-```
-
-Example commits:
-
-```text
-feat: initialize spring boot backend
-feat: add user and college entities
-feat: add authentication
-feat: add document upload
-feat: implement document chunking
-feat: add vector retrieval
-feat: add ai query endpoint
-feat: integrate ai chat frontend
-```
-
-Documentation commits:
-
-```text
-docs: add hld diagram
-docs: add backend lld
-docs: add database design
-docs: add rag architecture
-docs: update project roadmap
-```
-
----
-
-# 19. Project Development Principle
+# 18. Project Development Principle
 
 The project should be developed incrementally.
 
@@ -764,7 +741,7 @@ Once this vertical slice works, expand the workspace with notes, tasks, conversa
 
 ---
 
-# 20. Future Scope
+# 19. Future Scope
 
 Possible future improvements:
 
@@ -786,29 +763,13 @@ Possible future improvements:
 
 These are future enhancements and are **not required for the initial MVP**.
 
----
 
-# 21. Architecture Images
 
-The repository should contain the actual diagrams created during project planning.
 
-Recommended set:
-
-```text
-HLD
-Backend LLD
-AI/RAG LLD
-Database LLD
-Frontend LLD
-```
-
-The images are the detailed architectural reference.
-
-The README exists to explain **what the architecture means and why the decisions were made**, rather than redrawing the architecture in text.
 
 ---
 
-# 22. Current Status
+# 20. Current Status
 
 | Area | Status |
 |---|---|
@@ -826,7 +787,7 @@ The README exists to explain **what the architecture means and why the decisions
 
 ---
 
-# 23. Final Vision
+# 21. Final Vision
 
 The final system should behave like a **personal AI workspace connected to the user's academic environment**.
 
