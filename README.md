@@ -136,19 +136,9 @@ It explains:
 
 ### HLD image
 
-Place the HLD image in the repository, for example:
+![High-Level Design](docs/architecture/ProjectHLD.png)
 
-```text
-docs/architecture/HLD.png
-```
 
-Then reference it from this README:
-
-```markdown
-![High-Level Design](docs/architecture/HLD.png)
-```
-
-> The image is the authoritative visual representation of the HLD. This README intentionally avoids duplicating the complete diagram.
 
 ---
 
@@ -193,7 +183,7 @@ DTOs are kept separate from entities so that database models are not directly ex
 
 ### Backend LLD image
 
-Upload the previously created backend LLD image separately and reference it here.
+![Backend LLD](docs/architecture/BackendDesign.png)
 
 ---
 
@@ -238,8 +228,8 @@ Answer + Sources
 The RAG service is separated from the main Spring Boot application because Python provides a strong ecosystem for document processing, embeddings, vector search, and LLM integration.
 
 ### AI/RAG LLD image
-
-Upload the previously created RAG LLD image separately and reference it here.
+ 
+![AI/RAG LLD](docs/architecture/Ai:RAG_Design.png)
 
 ---
 
@@ -271,7 +261,7 @@ PostgreSQL is used as the main database, with pgvector for embeddings.
 
 ### Database LLD image
 
-Upload the previously created database LLD image separately and reference it here.
+![Data Design](docs/architecture/DataBaseDesign.png)
 
 ---
 
