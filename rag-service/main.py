@@ -77,6 +77,9 @@ RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.10"))
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() in {"1", "true", "yes"}
 RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 RAG_CANDIDATE_K = min(50, max(1, RAG_CANDIDATE_K))
+RAG_CONTEXT_CHUNKS = min(8, max(1, int(os.getenv("RAG_CONTEXT_CHUNKS", "4"))))
+RAG_CONTEXT_TOKEN_BUDGET = max(128, int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1800")))
+
 RAG_API_KEY = os.getenv("RAG_API_KEY", "")
 RAG_ENV = os.getenv("RAG_ENV", "development").lower()
 OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "350"))))
@@ -758,6 +761,7 @@ async def query_ai(req: QueryRequest):
         context_items = retrieve_context(
             req.question, question_embedding, req.user_id, scope, requested_k
         )
+        context_items = select_context_items(context_items)
         sources = []
         for item in context_items:
             filename = item.get("filename", "Document")
@@ -824,6 +828,52 @@ def clean_and_format_answer(answer: str) -> str:
     answer = re.sub(r'\n{3,}', '\n\n', answer)
     return answer.strip()
 
+def select_context_items(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate the ranked candidates and enforce an explicit context token budget."""
+    if not candidates:
+        return []
+    try:
+        tokenizer = getattr(get_model(), "tokenizer", None)
+    except Exception:
+        tokenizer = None
+
+    def token_count(text: str) -> int:
+        if tokenizer:
+            try:
+                return len(tokenizer.encode(text, add_special_tokens=False))
+            except Exception:
+                pass
+        return len(text.split())
+
+    selected: List[Dict[str, Any]] = []
+    seen_content = set()
+    used_tokens = 0
+    for original in candidates:
+        content = (original.get("content") or "").strip()
+        normalized = re.sub(r"\W+", " ", content.lower()).strip()
+        if not normalized or normalized in seen_content:
+            continue
+        seen_content.add(normalized)
+        remaining = RAG_CONTEXT_TOKEN_BUDGET - used_tokens
+        if remaining <= 0:
+            break
+        size = token_count(content)
+        if size > remaining:
+            if not tokenizer or remaining < 32:
+                continue
+            ids = tokenizer.encode(content, add_special_tokens=False)
+            content = tokenizer.decode(ids[:remaining], skip_special_tokens=True).strip()
+            size = token_count(content)
+        if not content:
+            continue
+        item = dict(original)
+        item["content"] = content
+        selected.append(item)
+        used_tokens += size
+        if len(selected) >= RAG_CONTEXT_CHUNKS:
+            break
+    return selected
+
 def _source_fallback(context_items: List[Dict[str, Any]], reason: str) -> str:
     highlights = []
     for item in context_items[:3]:
@@ -884,7 +934,7 @@ def generate_answer(
 
     # Prioritize top 4 most relevant excerpts to prevent context dilution
     formatted_excerpts = []
-    for i, item in enumerate(context_items[:4], 1):
+    for i, item in enumerate(context_items[:RAG_CONTEXT_CHUNKS], 1):
         fn = item.get("filename", "Uploaded Document")
         cnt = item.get("content", "").strip()
         page = item.get("page_number")
