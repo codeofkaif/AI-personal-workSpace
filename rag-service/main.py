@@ -57,6 +57,9 @@ class IngestResponse(BaseModel):
 # Model and vector-column dimensions must match. A model change requires re-embedding all chunks.
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
+LEGACY_EMBEDDING_MODEL_NAME = os.getenv("LEGACY_EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+if EMBEDDING_DIMENSION != 384:
+    raise RuntimeError("This schema currently uses vector(384). A different embedding dimension requires a database migration.")
 CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "350"))
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -86,17 +89,27 @@ def get_model():
         logger.info("Embedding model %s ready (dimension=%s)", EMBEDDING_MODEL_NAME, dimension)
     return _embedding_model
 
+def get_embeddings(texts: List[str], is_query: bool = False) -> List[List[float]]:
+    """Batch-encode and normalize texts; applies the required E5 query/passage prefix."""
+    if not texts or any(not value or not value.strip() for value in texts):
+        raise ValueError("Cannot embed an empty text")
+    model_inputs = []
+    for value in texts:
+        if "multilingual-e5" in EMBEDDING_MODEL_NAME.lower() or "e5-small" in EMBEDDING_MODEL_NAME.lower():
+            model_inputs.append(("query: " if is_query else "passage: ") + value)
+        else:
+            model_inputs.append(value)
+    vectors = get_model().encode(
+        model_inputs, batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "32")),
+        normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False
+    ).tolist()
+    if len(vectors) != len(texts) or any(len(vector) != EMBEDDING_DIMENSION for vector in vectors):
+        raise RuntimeError("Embedding model returned an invalid vector batch")
+    return vectors
+
 def get_embedding(text: str, is_query: bool = False) -> List[float]:
-    """Return a normalized embedding; add E5 prefixes when that model is selected."""
-    if not text or not text.strip():
-        raise ValueError("Cannot embed empty text")
-    model_input = text
-    if "multilingual-e5" in EMBEDDING_MODEL_NAME.lower() or "e5-small" in EMBEDDING_MODEL_NAME.lower():
-        model_input = ("query: " if is_query else "passage: ") + text
-    values = get_model().encode(model_input, normalize_embeddings=True, convert_to_numpy=True).tolist()
-    if len(values) != EMBEDDING_DIMENSION:
-        raise RuntimeError("Embedding dimension mismatch")
-    return values
+    """Single-text convenience wrapper around the batch embedding implementation."""
+    return get_embeddings([text], is_query=is_query)[0]
 
 # ── DB Connection ─────────────────────────────────────────────────────────────
 
