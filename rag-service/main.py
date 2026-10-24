@@ -127,11 +127,12 @@ def get_db_connection():
             user=os.getenv("DB_USER", "kaifkhan"),
             password=os.getenv("DB_PASSWORD", "")
         )
-        try:
-            from pgvector.psycopg2 import register_vector
-            register_vector(conn)
-        except Exception as e:
-            logger.warning("Could not register pgvector adapter: %s", e)
+        # The extension must exist before register_vector can discover its PostgreSQL type.
+        with conn.cursor() as cursor:
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        conn.commit()
+        from pgvector.psycopg2 import register_vector
+        register_vector(conn)
         return conn
     except Exception as e:
         logger.error(f"DB connection failed: {e}")
@@ -413,7 +414,7 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
     """Retrieve dense and lexical candidates; fuse rankings with Reciprocal Rank Fusion."""
     conn = get_db_connection()
     if not conn:
-        return []
+        raise HTTPException(status_code=503, detail="RAG database is unavailable.")
     where_sql, scope_params = _scope_filter(user_id, scope)
     candidate_k = max(top_k, RAG_CANDIDATE_K)
     fused: Dict[int, Dict[str, Any]] = {}
@@ -477,9 +478,9 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
             meta = item["metadata"]
             item["filename"] = meta.get("filename") or meta.get("title") or "Document"
         return candidates
-    except Exception:
+    except Exception as e:
         logger.exception("Hybrid retrieval failed")
-        return []
+        raise HTTPException(status_code=503, detail="Document retrieval failed; no answer was generated.") from e
     finally:
         conn.close()
 
