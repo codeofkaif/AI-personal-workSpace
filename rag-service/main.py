@@ -1042,8 +1042,10 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
             }
         }
         # Explicitly control thinking mode for reasoning models (Qwen, DeepSeek, etc.)
+        # Default OFF: thinking adds latency and causes empty-response failures on short queries.
+        # Set OLLAMA_THINK=true in .env only if you want chain-of-thought reasoning.
         think_enabled = (
-            os.getenv("OLLAMA_THINK", "true").strip().lower()
+            os.getenv("OLLAMA_THINK", "false").strip().lower()
             in {"1", "true", "yes", "on"}
         )
         if OLLAMA_MODEL.lower().startswith(("qwen", "deepseek")):
@@ -1065,12 +1067,22 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
                 result.get("eval_count"), result.get("total_duration"), result.get("load_duration")
             )
             raw_response = result.get("response", "").strip()
-            if not raw_response and result.get("thinking"):
-                logger.warning(
-                    "Ollama returned thinking output but no final response for model=%s; refusing to expose thinking as the answer.",
-                    OLLAMA_MODEL,
-                )
-            return raw_response or None
+            if not raw_response:
+                thinking_text = result.get("thinking", "").strip()
+                if thinking_text:
+                    # Thinking model returned chain-of-thought but no final answer.
+                    # Strip <think> tags and use the thinking content as the answer.
+                    logger.warning(
+                        "Ollama returned thinking-only output for model=%s; extracting answer from thinking block.",
+                        OLLAMA_MODEL,
+                    )
+                    extracted = re.sub(r'<think>[\s\S]*?</think>', '', thinking_text, flags=re.IGNORECASE).strip()
+                    if not extracted:
+                        # Thinking block was the full content — use it directly after cleanup
+                        extracted = thinking_text
+                    return extracted or None
+                return None
+            return raw_response
         logger.warning("Ollama returned status=%s after %.1f ms", resp.status_code, elapsed_ms)
     except Exception as e:
         logger.warning(f"Ollama call failed: {e}")
@@ -1181,6 +1193,72 @@ def _source_fallback(context_items: List[Dict[str, Any]], reason: str) -> str:
         + f"\n\n*{reason}*"
     )
 
+
+# ---------------------------------------------------------------------------
+# Fast factual extractor — finds specific values from chunks directly
+# without needing an LLM call.  Used as a pre-Ollama shortcut for simple
+# self-referential factual queries (roll number, email, phone, etc.).
+# ---------------------------------------------------------------------------
+_FACTUAL_PATTERNS = [
+    # Roll / enrollment number (Indian college patterns)
+    (r"roll\s*(?:no|number|num|#)",
+     r"(?:roll\s*(?:no|number|num|#)[:\s.-]*)(\S+)",
+     "Roll Number"),
+    (r"enrollment\s*(?:no|number|num|#)",
+     r"(?:enrollment\s*(?:no|number|num|#)[:\s.-]*)(\S+)",
+     "Enrollment Number"),
+    (r"student\s*id",
+     r"(?:student\s*id[:\s.-]*)(\S+)",
+     "Student ID"),
+    # Email
+    (r"email",
+     r"([\w.+-]+@[\w-]+\.[\w.-]+)",
+     "Email"),
+    # Phone
+    (r"(?:phone|mobile|contact|whatsapp)",
+     r"(?:(?:\+91[\s-]?)?[6-9]\d{9})",
+     "Phone"),
+    # CGPA / GPA
+    (r"cgpa|gpa",
+     r"(?:cgpa|gpa)[:\s]*([\d.]+)",
+     "CGPA"),
+    # Date of Birth
+    (r"(?:dob|date\s*of\s*birth|born)",
+     r"(?:dob|date\s*of\s*birth|born)[:\s]*([\d]{1,2}[/-][\d]{1,2}[/-][\d]{2,4}|[\d]{4}-[\d]{2}-[\d]{2})",
+     "Date of Birth"),
+]
+
+def _extract_factual_answer(
+    question: str,
+    context_items: List[Dict[str, Any]],
+    user_name: str,
+) -> Optional[str]:
+    """
+    Attempt to extract a short factual value directly from context chunks
+    using regex patterns, bypassing the LLM entirely.
+    Returns a formatted answer string, or None if no match found.
+    """
+    q_lower = question.lower()
+    for trigger_pattern, extract_pattern, label in _FACTUAL_PATTERNS:
+        if not re.search(trigger_pattern, q_lower, re.IGNORECASE):
+            continue
+        for item in context_items:
+            text = item.get("content", "")
+            match = re.search(extract_pattern, text, re.IGNORECASE)
+            if match:
+                value = match.group(1) if match.lastindex else match.group(0)
+                value = value.strip().rstrip(",.:;")
+                source = item.get("filename", "your document")
+                logger.info(
+                    "factual_extractor: found %s=%r in %s for query=%r",
+                    label, value, source, question,
+                )
+                return (
+                    f"📋 **{label}:** `{value}`\n\n"
+                    f"[Source: {source}]"
+                )
+    return None
+
 def _validate_source_citations(answer: str, context_items: List[Dict[str, Any]]) -> str:
     """Reject fabricated source labels and ensure the response exposes its real source set."""
     allowed = {str(item.get("filename", "Document")).strip() for item in context_items}
@@ -1285,6 +1363,14 @@ USER QUESTION:
 
 STRUCTURED & FACTUAL RESPONSE:"""
 
+    # --- Fast-path: regex factual extractor (no LLM needed for simple lookups) ---
+    if context_items:
+        fast_answer = _extract_factual_answer(question, context_items, first_name)
+        if fast_answer:
+            logger.info("factual_extractor returned direct answer; skipping Ollama")
+            return fast_answer
+
+    # --- LLM path: call Ollama with a concise focused prompt ---
     ollama_answer = _call_ollama(prompt, max_tokens=OLLAMA_NUM_PREDICT)
     if ollama_answer:
         cleaned = clean_and_format_answer(ollama_answer)
@@ -1292,6 +1378,8 @@ STRUCTURED & FACTUAL RESPONSE:"""
         logger.info("Ollama (%s) generated a grounded answer", OLLAMA_MODEL)
         return cleaned
 
+    # --- Last resort: show raw source excerpts ---
+    logger.warning("Ollama returned no answer; falling back to source excerpts")
     return _source_fallback(context_items, "Ollama was unavailable; only source excerpts are shown.")
 
 if __name__ == "__main__":
