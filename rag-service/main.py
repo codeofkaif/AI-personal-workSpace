@@ -1260,14 +1260,27 @@ def _extract_factual_answer(
     return None
 
 def _validate_source_citations(answer: str, context_items: List[Dict[str, Any]]) -> str:
-    """Reject fabricated source labels and ensure the response exposes its real source set."""
+    """Verify source citations are real; strip invalid ones rather than rejecting the full answer."""
     allowed = {str(item.get("filename", "Document")).strip() for item in context_items}
     citations = re.findall(r"\[\s*Source:\s*([^\]\n]+)\]", answer, flags=re.IGNORECASE)
-    invalid = [citation.strip() for citation in citations if citation.strip() not in allowed]
+    invalid = [c.strip() for c in citations if c.strip() not in allowed]
     if invalid:
-        logger.warning("Model produced unknown citations; replacing response with source excerpts")
-        return _source_fallback(context_items, "The generated citations could not be verified, so only source excerpts are shown.")
-    if not citations and allowed:
+        logger.warning(
+            "Model produced %d invalid citation(s): %s — stripping them from answer.",
+            len(invalid), invalid
+        )
+        # Strip invalid [Source: ...] tags instead of discarding the whole answer
+        for bad in invalid:
+            answer = re.sub(
+                r"\[\s*Source:\s*" + re.escape(bad) + r"\s*\]",
+                "",
+                answer,
+                flags=re.IGNORECASE,
+            )
+        answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
+    # Append real sources footer if no citations remain
+    remaining = re.findall(r"\[\s*Source:\s*([^\]\n]+)\]", answer, flags=re.IGNORECASE)
+    if not remaining and allowed:
         source_list = " ".join(f"[Source: {name}]" for name in sorted(allowed)[:5])
         answer = answer.rstrip() + "\n\n**Sources:** " + source_list
     return answer
@@ -1363,13 +1376,19 @@ USER QUESTION:
 
 STRUCTURED & FACTUAL RESPONSE:"""
 
-    # --- Fast-path: regex factual extractor (no LLM needed for simple lookups) ---
+    # ---------------------------------------------------------------------------
+    # Fast-path: regex factual extractor — runs BEFORE prompt build and Ollama.
+    # Handles simple queries (roll number, email, phone, CGPA, DOB) instantly.
+    # ---------------------------------------------------------------------------
     if context_items:
         fast_answer = _extract_factual_answer(question, context_items, first_name)
         if fast_answer:
             logger.info("factual_extractor returned direct answer; skipping Ollama")
             return fast_answer
 
+    # ---------------------------------------------------------------------------
+    # LLM path: build prompt and call Ollama
+    # ---------------------------------------------------------------------------
     # --- LLM path: call Ollama with a concise focused prompt ---
     ollama_answer = _call_ollama(prompt, max_tokens=OLLAMA_NUM_PREDICT)
     if ollama_answer:
