@@ -258,7 +258,7 @@ def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
     if any(phrase in q_lower for phrase in self_phrases):
         return True
 
-    words = set(re.findall(r"\\b\\w+\\b", q_lower))
+    words = set(re.findall(r"\b\w+\b", q_lower))
     if words & {"mera", "meri", "mere", "apne", "apna", "apni"}:
         return True
     # English "my" is only a signal when paired with an actual profile field.
