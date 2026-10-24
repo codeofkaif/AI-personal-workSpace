@@ -4,7 +4,8 @@ Handles: Document Ingestion, Embedding, Vector Search, LLM Answer Generation
 Trained for User Identity & Role Awareness ("me" / "mera" = authenticated user profile)
 """
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -12,6 +13,7 @@ import os
 import json
 import logging
 import re
+import hmac
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -433,6 +435,16 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
         return []
     finally:
         conn.close()
+
+@app.middleware("http")
+async def protect_internal_rag_endpoints(request: Request, call_next):
+    """Require the shared backend/service key when configured; fail closed in production."""
+    if request.url.path in {"/query", "/ingest"}:
+        if RAG_ENV == "production" and not RAG_API_KEY:
+            return JSONResponse(status_code=503, content={"detail": "RAG_API_KEY must be configured in production."})
+        if RAG_API_KEY and not hmac.compare_digest(request.headers.get("X-RAG-API-Key", ""), RAG_API_KEY):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized RAG service request."})
+    return await call_next(request)
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
