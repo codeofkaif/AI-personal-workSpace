@@ -568,125 +568,21 @@ async def query_ai(req: QueryRequest):
 
         # 1. Embed question
         try:
-            question_embedding = get_embedding(req.question)
+            question_embedding = get_embedding(req.question, is_query=True)
         except Exception as e:
             logger.exception("Query embedding failed")
             raise HTTPException(status_code=503, detail="Embedding model unavailable or misconfigured.") from e
 
-        # 2. Search pgvector with STRICT USER PERMISSION ENFORCEMENT & Hybrid Keyword Search
-        conn = get_db_connection()
-        if conn:
-            try:
-                cursor = conn.cursor()
-
-                # User personal documents search:
-                # Prioritize user's own files (resume, scholarship, notes)
-                if req.user_id and scope != "College Only":
-                    cursor.execute("""
-                        SELECT dc.content, dc.metadata, 1 - (dc.embedding <=> %s::vector) AS similarity
-                        FROM document_chunks dc
-                        LEFT JOIN documents d ON dc.document_id = d.id
-                        WHERE COALESCE(d.user_id, (dc.metadata->>'user_id')::bigint) = %s
-                          AND (d.is_college_doc IS NOT TRUE)
-                        ORDER BY dc.embedding <=> %s::vector
-                        LIMIT 5
-                    """, (question_embedding, req.user_id, question_embedding))
-                    user_rows = cursor.fetchall()
-                    for c, m, sim in user_rows:
-                        fn = "User Document"
-                        if isinstance(m, dict):
-                            fn = m.get("filename", "User Document")
-                        elif isinstance(m, str):
-                            try:
-                                fn = json.loads(m).get("filename", "User Document")
-                            except Exception:
-                                fn = "User Document"
-                        
-                        # Match if similarity is reasonable OR filename/content keywords appear in query
-                        q_words = [w.lower() for w in re.findall(r'\w+', req.question) if len(w) > 3]
-                        fn_lower = fn.lower()
-                        keyword_match = any(w in fn_lower for w in q_words)
-
-                        if (sim > 0.08 or keyword_match or is_self):
-                            if not any(item["content"] == c for item in context_items):
-                                context_items.append({"content": c, "filename": fn, "similarity": sim})
-                            if fn not in sources:
-                                sources.append(fn)
-
-                # STRICT ISOLATION QUERY:
-                # User can ONLY see:
-                # 1. College-wide public documents (d.is_college_doc = true)
-                # 2. Their OWN uploaded documents (user_id = req.user_id)
-                # NEVER another user's private documents!
-                if scope == "Personal Only" and req.user_id:
-                    cursor.execute("""
-                        SELECT dc.content, dc.metadata, 1 - (dc.embedding <=> %s::vector) AS similarity
-                        FROM document_chunks dc
-                        LEFT JOIN documents d ON dc.document_id = d.id
-                        WHERE COALESCE(d.user_id, (dc.metadata->>'user_id')::bigint) = %s
-                          AND (d.is_college_doc IS NOT TRUE)
-                        ORDER BY dc.embedding <=> %s::vector
-                        LIMIT %s
-                    """, (question_embedding, req.user_id, question_embedding, max(req.top_k or 8, 8)))
-
-                elif scope == "College Only":
-                    cursor.execute("""
-                        SELECT dc.content, dc.metadata, 1 - (dc.embedding <=> %s::vector) AS similarity
-                        FROM document_chunks dc
-                        LEFT JOIN documents d ON dc.document_id = d.id
-                        WHERE (d.is_college_doc = true OR (dc.metadata->>'is_college_doc')::boolean = true)
-                        ORDER BY dc.embedding <=> %s::vector
-                        LIMIT %s
-                    """, (question_embedding, question_embedding, max(req.top_k or 8, 8)))
-
-                else:
-                    # Default "College + Personal"
-                    if req.user_id:
-                        cursor.execute("""
-                            SELECT dc.content, dc.metadata, 1 - (dc.embedding <=> %s::vector) AS similarity
-                            FROM document_chunks dc
-                            LEFT JOIN documents d ON dc.document_id = d.id
-                            WHERE (
-                                (d.is_college_doc = true OR (dc.metadata->>'is_college_doc')::boolean = true)
-                                OR (COALESCE(d.user_id, (dc.metadata->>'user_id')::bigint) = %s)
-                            )
-                            ORDER BY dc.embedding <=> %s::vector
-                            LIMIT %s
-                        """, (question_embedding, req.user_id, question_embedding, max(req.top_k or 8, 8)))
-                    else:
-                        # Non-authenticated: college public docs ONLY
-                        cursor.execute("""
-                            SELECT dc.content, dc.metadata, 1 - (dc.embedding <=> %s::vector) AS similarity
-                            FROM document_chunks dc
-                            LEFT JOIN documents d ON dc.document_id = d.id
-                            WHERE (d.is_college_doc = true OR (dc.metadata->>'is_college_doc')::boolean = true)
-                            ORDER BY dc.embedding <=> %s::vector
-                            LIMIT %s
-                        """, (question_embedding, question_embedding, max(req.top_k or 8, 8)))
-
-                rows = cursor.fetchall()
-                for content, metadata, sim in rows:
-                    if sim > 0.10:
-                        fname = "Document"
-                        if isinstance(metadata, dict):
-                            fname = metadata.get("filename", "Document")
-                        elif isinstance(metadata, str):
-                            try:
-                                parsed = json.loads(metadata)
-                                fname = parsed.get("filename", "Document")
-                            except Exception:
-                                fname = metadata
-                        if not any(item["content"] == content for item in context_items):
-                            context_items.append({"content": content, "filename": fname, "similarity": sim})
-                        if fname and fname not in sources:
-                            sources.append(fname)
-
-                cursor.close()
-                conn.close()
-            except Exception as e:
-                logger.warning(f"Vector search failed: {e}")
-                if conn:
-                    conn.close()
+        # 2. Retrieve authorized candidates with hybrid dense + lexical RRF ranking.
+        requested_k = max(1, min(int(req.top_k or 5), 8))
+        context_items = retrieve_context(
+            req.question, question_embedding, req.user_id, scope, requested_k
+        )
+        sources = []
+        for item in context_items:
+            filename = item.get("filename", "Document")
+            if filename not in sources:
+                sources.append(filename)
 
         # 3. Generate grounded answer with Advanced Prompt Engineering
         answer = generate_answer(req.question, context_items, user_profile, is_self)
@@ -787,7 +683,9 @@ def generate_answer(
     for i, item in enumerate(context_items[:4], 1):
         fn = item.get("filename", "Uploaded Document")
         cnt = item.get("content", "").strip()
-        formatted_excerpts.append(f"=== [DOCUMENT #{i} | File: {fn}] ===\n{cnt}")
+        page = item.get("page_number")
+        page_label = f" | Page: {page}" if page not in (None, 0) else ""
+        formatted_excerpts.append(f"=== [DOCUMENT #{i} | File: {fn}{page_label}] ===\n{cnt}")
 
     context_str = "\n\n".join(formatted_excerpts)
 
