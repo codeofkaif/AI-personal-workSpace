@@ -8,6 +8,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
@@ -145,14 +147,16 @@ public class DocumentService {
         }
     }
 
-    private IllegalStateException indexingFailure(String filename, int chunks) {
+    private ResponseStatusException indexingFailure(String filename, int chunks) {
         if (chunks == 0) {
-            return new IllegalStateException(
+            return new ResponseStatusException(
+                HttpStatus.UNPROCESSABLE_ENTITY,
                 "Upload rejected: no searchable text chunks were produced for '" + filename
                     + "'. For scanned PDFs, install Tesseract OCR and verify its language packs, then upload again."
             );
         }
-        return new IllegalStateException(
+        return new ResponseStatusException(
+            HttpStatus.SERVICE_UNAVAILABLE,
             "Upload failed: the RAG service did not confirm document indexing for '" + filename
                 + "'. Check RAG health, the shared RAG_API_KEY, and service logs, then retry."
         );
