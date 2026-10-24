@@ -77,6 +77,7 @@ public class DocumentService {
             .fileType(file.getContentType())
             .fileSize(file.getSize())
             .user(admin)
+            .college(admin.getCollege())
             .isCollegeDoc(true)
             .build();
         doc = documentRepository.save(doc);
