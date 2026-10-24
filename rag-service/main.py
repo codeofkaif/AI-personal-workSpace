@@ -85,11 +85,15 @@ RAG_CONTEXT_TOKEN_BUDGET = max(128, int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1
 
 RAG_API_KEY = os.getenv("RAG_API_KEY", "")
 RAG_ENV = os.getenv("RAG_ENV", "development").lower()
-OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "350"))))
-OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")))
+OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "450"))))
+OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120")))
 RAG_WARMUP_ON_STARTUP = os.getenv("RAG_WARMUP_ON_STARTUP", "false").lower() in {"1", "true", "yes"}
-RAG_MAX_CONCURRENT_QUERIES = max(1, int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "2")))
+RAG_MAX_CONCURRENT_QUERIES = max(1, int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "1")))
 RAG_MAX_CONCURRENT_INGESTIONS = max(1, int(os.getenv("RAG_MAX_CONCURRENT_INGESTIONS", "1")))
+OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b-q4_K_M")
+OLLAMA_THINK = os.getenv("OLLAMA_THINK", "true").strip().lower() in {"1", "true", "yes", "on"}
 _QUERY_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_QUERIES)
 _INGEST_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_INGESTIONS)
 
@@ -270,7 +274,7 @@ def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
 
 def _ocr_pdf_page(file_bytes: bytes, page_index: int) -> str:
     """Optional local OCR fallback. Requires PyMuPDF and the system Tesseract binary."""
-    if os.getenv("OCR_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+    if not OCR_ENABLED:
         return ""
     if not shutil.which("tesseract"):
         logger.warning("OCR is enabled but Tesseract is not installed; scanned PDF pages remain unreadable.")
@@ -594,9 +598,26 @@ def _bounded_endpoint(semaphore: BoundedSemaphore, operation: str):
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+def _ollama_model_available(models: Any, configured_model: str) -> bool:
+    """Return true only when the exact configured model tag is present in /api/tags."""
+    expected = (configured_model or "").strip()
+    if not expected or not isinstance(models, list):
+        return False
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "").strip()
+        if name == expected:
+            return True
+        # Ollama treats an omitted tag as :latest; do not treat another quantization/tag as a match.
+        if ":" not in expected and name == f"{expected}:latest":
+            return True
+    return False
+
+
 @app.get("/health")
 def health_check():
-    """Report dependency readiness without forcing large embedding/reranker models to load."""
+    """Report DB/model readiness and OCR capability without loading embedding/reranker weights."""
     database_ok = False
     conn = get_db_connection()
     if conn is not None:
@@ -609,25 +630,51 @@ def health_check():
         finally:
             conn.close()
 
-    ollama_ok = False
+    ollama_api_ok = False
+    configured_model_ok = False
     try:
         import httpx
         response = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2.0)
-        ollama_ok = response.status_code == 200
+        ollama_api_ok = response.status_code == 200
+        if ollama_api_ok:
+            configured_model_ok = _ollama_model_available(
+                response.json().get("models", []), OLLAMA_MODEL
+            )
     except Exception:
-        ollama_ok = False
+        logger.exception("Ollama/model readiness check failed")
 
-    status = "healthy" if database_ok and ollama_ok else "degraded"
+    tesseract_available = bool(shutil.which("tesseract")) if OCR_ENABLED else None
+    warnings = []
+    if not ollama_api_ok:
+        warnings.append("Ollama API is unavailable.")
+    elif not configured_model_ok:
+        warnings.append(
+            f"Configured Ollama model '{OLLAMA_MODEL}' is not installed; pull this exact model tag."
+        )
+    if OCR_ENABLED and not tesseract_available:
+        warnings.append(
+            "OCR is enabled but Tesseract is not installed; scanned/image-only PDFs will not be searchable."
+        )
+
+    ready = database_ok and ollama_api_ok and configured_model_ok
+    degraded = (not ready) or (OCR_ENABLED and not tesseract_available)
     return {
-        "status": status,
+        "status": "degraded" if degraded else "healthy",
         "service": "RAG Service",
-        "version": "1.2.0",
-        "checks": {"database": "up" if database_ok else "down", "ollama": "up" if ollama_ok else "down"},
+        "version": "1.3.0",
+        "checks": {
+            "database": "up" if database_ok else "down",
+            "ollama": "up" if ollama_api_ok else "down",
+            "ollama_model": "available" if configured_model_ok else ("missing" if ollama_api_ok else "unknown"),
+            "ocr": "available" if tesseract_available is True else ("missing" if OCR_ENABLED else "disabled"),
+        },
+        "configured_ollama_model": OLLAMA_MODEL,
         "embedding_model": EMBEDDING_MODEL_NAME,
         "embedding_dimension": EMBEDDING_DIMENSION,
         "embedding_loaded": _embedding_model is not None,
         "reranking_enabled": RERANK_ENABLED,
         "reranker_loaded": _RERANKER is not None,
+        "warnings": warnings,
     }
 
 @app.post("/ingest", response_model=IngestResponse)
@@ -657,18 +704,30 @@ def ingest_document(
         page_texts = extract_pages_from_file(file_bytes, filename)
         page_texts = [(page, text) for page, text in page_texts if text.strip()]
         if not page_texts:
-            return IngestResponse(
-                success=False,
-                message=f"No readable text could be extracted from '{filename}'. Scanned PDFs may require OCR.",
-                chunks_created=0
+            message = (
+                f"No readable text could be extracted from '{filename}'. "
+                "The document was not indexed and must not be treated as searchable."
             )
+            if suffix == ".pdf" and OCR_ENABLED and not shutil.which("tesseract"):
+                message += (
+                    " OCR is enabled, but the Tesseract executable is missing. "
+                    "On macOS install it with 'brew install tesseract', verify language data with "
+                    "'tesseract --list-langs', restart the RAG service, and upload the file again."
+                )
+            elif suffix == ".pdf":
+                message += " If this is a scanned/image-only PDF, verify Tesseract OCR and the required language packs."
+            return IngestResponse(success=False, message=message, chunks_created=0)
         chunk_records = [
             (page_number, chunk)
             for page_number, page_text in page_texts
             for chunk in chunk_text(page_text)
         ]
         if not chunk_records:
-            return IngestResponse(success=False, message="No non-empty chunks were produced.", chunks_created=0)
+            return IngestResponse(
+                success=False,
+                message=f"No non-empty text chunks could be produced for '{filename}'; the document was not indexed.",
+                chunks_created=0
+            )
 
         clean_chunks = [chunk.replace("\x00", "").strip() for _, chunk in chunk_records]
         embeddings = get_embeddings(clean_chunks)
@@ -867,9 +926,6 @@ def query_ai(req: QueryRequest):
         logger.exception("Query error")
         raise HTTPException(status_code=500, detail="AI query failed due to an internal error.") from e
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen3:4b-instruct-2507-q4_K_M")
-
 def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[str]:
     """Call local Ollama API with tuned generation parameters"""
     try:
@@ -887,9 +943,9 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
                 "repeat_penalty": 1.08,
             }
         }
-        # Qwen3 supports explicitly disabling its thinking mode for lower latency.
+        # Thinking can be enabled/disabled through OLLAMA_THINK in the shared .env.
         if OLLAMA_MODEL.lower().startswith("qwen3"):
-            payload["think"] = False
+            payload["think"] = OLLAMA_THINK
         started = time.perf_counter()
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
