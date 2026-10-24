@@ -40,6 +40,8 @@ public class AIClientService {
             body.put("question", req.getQuestion());
             body.put("user_id", user != null ? user.getId() : null);
             body.put("top_k", req.getTopK() != null ? req.getTopK() : 5);
+            body.put("conversation_history",
+                req.getConversationHistory() != null ? req.getConversationHistory() : List.of());
             if (req.getScope() != null) {
                 body.put("scope", req.getScope());
             }
@@ -80,6 +82,7 @@ public class AIClientService {
                 return QueryResponse.builder()
                     .answer((String) resp.getOrDefault("answer", "No answer found"))
                     .sources((List<String>) resp.getOrDefault("sources", List.of()))
+                    .clarificationNeeded(Boolean.TRUE.equals(resp.get("clarification_needed")))
                     .build();
             }
         } catch (Exception e) {
