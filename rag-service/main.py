@@ -173,10 +173,10 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
             if row:
                 profile["name"] = row[0] or profile["name"]
                 profile["email"] = row[1] or profile["email"]
-                profile["role"] = (row[2] or "STUDENT").upper()
+                profile["role"] = (row[2] or profile.get("role") or "UNKNOWN").upper()
                 profile["department"] = row[3] or profile["department"]
                 profile["roll_number"] = row[4] or profile["roll_number"]
-                profile["cgpa"] = float(row[5]) if row[5] is not None else 8.5
+                profile["cgpa"] = float(row[5]) if row[5] is not None else None
                 if row[6]:
                     profile["college"] = row[6]
 
@@ -618,7 +618,7 @@ async def query_ai(req: QueryRequest):
                     f"• 🛡️ **Role:** **{user_profile['role']}** ({role_desc})\n"
                     f"• 🏢 **Department:** {user_profile['department']}\n"
                     f"• 🏛️ **Institute:** {user_profile['college']}\n\n"
-                    f"✨ *Aapko aapke role ke anusaar sabhi features aur dashboard access activate hain.*"
+                    f"Note: dashboard permissions are enforced by the application using this saved role."
                 ),
                 sources=["User Session Profile"],
                 chunks_used=1
@@ -778,10 +778,10 @@ def generate_answer(
             f"Aapka current academic profile overview:\n\n"
             f"• 🛡️ **Role:** {user_profile.get('role')}\n"
             f"• 🎓 **Department:** {user_profile.get('department')}\n"
-            f"• 🆔 **Roll Number:** `{user_profile.get('roll_number')}`\n"
-            f"• 📊 **CGPA:** **{user_profile.get('cgpa')}** / 10.0\n"
-            f"• 🌟 **Placement Readiness:** **{user_profile.get('placement_score')}%**\n\n"
-            f"💡 *Apni detailed technical skills, resume projects ya scholarship verify karne ke liye apna PDF document upload karein.*"
+            f"• 🆔 **Roll Number:** `{user_profile.get('roll_number') or 'Not available'}`\n"
+            f"• 📊 **CGPA:** **{user_profile.get('cgpa') if user_profile.get('cgpa') is not None else 'Not available'}**\n"
+            f"• 🌟 **Placement Readiness:** **{str(user_profile.get('placement_score')) + '%' if user_profile.get('placement_score') is not None else 'Not assessed'}**\n\n"
+            f"💡 *Apni details verify karne ke liye relevant document upload karein.*"
         )
 
     # Prioritize top 4 most relevant excerpts to prevent context dilution
