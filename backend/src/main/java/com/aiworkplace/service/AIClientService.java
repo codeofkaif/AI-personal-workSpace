@@ -177,7 +177,11 @@ public class AIClientService {
     public String getStatus() {
         try {
             ResponseEntity<Map> response = restTemplate.getForEntity(ragBaseUrl + "/health", Map.class);
-            return response.getStatusCode().is2xxSuccessful() ? "ONLINE" : "DEGRADED";
+            if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
+                return "DEGRADED";
+            }
+            Object status = response.getBody().get("status");
+            return "healthy".equalsIgnoreCase(String.valueOf(status)) ? "ONLINE" : "DEGRADED";
         } catch (Exception e) {
             return "OFFLINE";
         }
