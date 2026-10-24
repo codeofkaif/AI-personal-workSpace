@@ -86,6 +86,7 @@ RAG_API_KEY = os.getenv("RAG_API_KEY", "")
 RAG_ENV = os.getenv("RAG_ENV", "development").lower()
 OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "350"))))
 OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")))
+RAG_WARMUP_ON_STARTUP = os.getenv("RAG_WARMUP_ON_STARTUP", "false").lower() in {"1", "true", "yes"}
 
 _embedding_model = None
 _embedding_model_lock = Lock()
@@ -865,6 +866,36 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
     except Exception as e:
         logger.warning(f"Ollama call failed: {e}")
     return None
+
+@app.on_event("startup")
+def warm_up_rag_models():
+    """Optionally pay model-load cost at startup instead of on the first user request."""
+    if not RAG_WARMUP_ON_STARTUP:
+        return
+    started = time.perf_counter()
+    try:
+        get_embeddings(["warm up embedding model"], is_query=True)
+        logger.info("Embedding model warm-up complete")
+    except Exception:
+        logger.exception("Embedding model warm-up failed; readiness will expose later query failures")
+
+    if RERANK_ENABLED:
+        try:
+            global _RERANKER
+            with _RERANKER_LOCK:
+                if _RERANKER is None:
+                    from sentence_transformers import CrossEncoder
+                    _RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
+            _RERANKER.predict([("warm up query", "warm up document")], show_progress_bar=False)
+            logger.info("Reranker warm-up complete")
+        except Exception:
+            logger.exception("Reranker warm-up failed; retrieval will use the RRF fallback")
+
+    try:
+        _call_ollama("Return only the word OK.", max_tokens=1)
+    except Exception:
+        logger.exception("Ollama warm-up failed; generation will retry at request time")
+    logger.info("RAG model warm-up finished in %.1f seconds", time.perf_counter() - started)
 
 def clean_and_format_answer(answer: str) -> str:
     """Ensure the answer is clean, professional, and properly structured in Markdown"""
