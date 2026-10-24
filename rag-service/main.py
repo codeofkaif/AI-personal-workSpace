@@ -28,8 +28,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[x.strip() for x in os.getenv("RAG_CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",") if x.strip()],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-RAG-API-Key"],
 )
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
@@ -527,18 +527,23 @@ async def ingest_document(
             raise HTTPException(status_code=413, detail="Uploaded file exceeds the configured size limit.")
         logger.info("Ingesting %s (%s bytes) for user %s", filename, len(file_bytes), user_id)
 
-        text = extract_text_from_file(file_bytes, filename)
-        if not text.strip():
+        page_texts = extract_pages_from_file(file_bytes, filename)
+        page_texts = [(page, text) for page, text in page_texts if text.strip()]
+        if not page_texts:
             return IngestResponse(
                 success=False,
                 message=f"No readable text could be extracted from '{filename}'. Scanned PDFs may require OCR.",
                 chunks_created=0
             )
-        chunks = chunk_text(text)
-        if not chunks:
+        chunk_records = [
+            (page_number, chunk)
+            for page_number, page_text in page_texts
+            for chunk in chunk_text(page_text)
+        ]
+        if not chunk_records:
             return IngestResponse(success=False, message="No non-empty chunks were produced.", chunks_created=0)
 
-        clean_chunks = [chunk.replace("\x00", "").strip() for chunk in chunks]
+        clean_chunks = [chunk.replace("\x00", "").strip() for _, chunk in chunk_records]
         embeddings = get_embeddings(clean_chunks)
         conn = get_db_connection()
         if conn is None:
@@ -546,8 +551,19 @@ async def ingest_document(
         ensure_chunk_schema(conn)
         cursor = conn.cursor()
 
-        # Delete-and-reinsert runs in one transaction, preserving old chunks if any insert fails.
+        # Verify that the authenticated backend user owns this document before deleting/replacing chunks.
         if document_id is not None:
+            cursor.execute(
+                "SELECT user_id, is_college_doc FROM documents WHERE id = %s FOR UPDATE",
+                (document_id,)
+            )
+            owner = cursor.fetchone()
+            if not owner:
+                raise HTTPException(status_code=404, detail="Document record not found.")
+            if int(owner[0]) != int(user_id):
+                raise HTTPException(status_code=403, detail="User does not own this document.")
+            if bool(owner[1]):
+                logger.info("Reindexing college-scoped document %s for owner %s", document_id, user_id)
             cursor.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
         else:
             cursor.execute(
@@ -566,12 +582,12 @@ async def ingest_document(
             "chunk_size_tokens": CHUNK_SIZE_TOKENS,
             "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS
         })
-        for index, (chunk, embedding) in enumerate(zip(clean_chunks, embeddings)):
+        for index, ((page_number, chunk), embedding) in enumerate(zip(chunk_records, embeddings)):
             cursor.execute(
                 """INSERT INTO document_chunks
-                   (content, metadata, chunk_index, document_id, embedding, embedding_model)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (chunk, metadata, index, document_id, embedding, EMBEDDING_MODEL_NAME)
+                   (content, metadata, page_number, chunk_index, document_id, embedding, embedding_model)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (chunk, metadata, page_number, index, document_id, embedding, EMBEDDING_MODEL_NAME)
             )
         conn.commit()
         cursor.close()
