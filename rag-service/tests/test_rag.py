@@ -60,13 +60,14 @@ def test_college_scope_checks_current_users_college():
     assert params == (42, 42)
 
 
-def test_unknown_citation_falls_back_to_source_excerpt():
+def test_unknown_citation_is_stripped_and_real_source_is_attached():
+    # Citation validation strips fabricated source labels, then lists only retrieved sources.
     context = [{"filename": "syllabus.pdf", "content": "The exam is in December."}]
     answer = "The exam is in May. [Source: made-up.pdf]"
     result = main._validate_source_citations(answer, context)
     assert "made-up.pdf" not in result
     assert "syllabus.pdf" in result
-    assert "could not be verified" in result
+    assert "**Sources:**" in result
 
 
 def test_missing_citation_adds_actual_source_label():
@@ -310,6 +311,15 @@ def test_upload_then_immediate_query_retrieves_the_new_database_chunk(monkeypatc
         return f"The indexed marker is {marker}. [Source: fresh.txt]"
 
     monkeypatch.setattr(main, "generate_answer", fake_generate)
+    # Avoid external Ollama calls inside this deterministic ingestion/retrieval test.
+    monkeypatch.setattr(
+        main, "_classify_query_clarity",
+        lambda question, history: {
+            "action": "answer",
+            "normalized_query": question,
+            "clarification_question": None,
+        },
+    )
     headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
 
     with TestClient(main.app) as client:
@@ -350,3 +360,111 @@ def test_upload_then_immediate_query_retrieves_the_new_database_chunk(monkeypatc
         assert marker in query_json["answer"]
         assert query_json["sources"] == ["fresh.txt"]
         assert seen_context["items"][0]["content"] == f"Private test marker: {marker}."
+
+
+
+def test_obvious_unclear_query_returns_followup_without_db_embedding_or_generation(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Clarification must happen before profile lookup, embeddings and retrieval")
+
+    monkeypatch.setattr(main, "fetch_user_profile", forbidden)
+    monkeypatch.setattr(main, "get_embedding", forbidden)
+    monkeypatch.setattr(main, "retrieve_context", forbidden)
+    monkeypatch.setattr(main, "generate_answer", forbidden)
+    headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/query",
+            json={"question": "Explain this", "user_id": 42, "scope": "Personal Only"},
+            headers=headers,
+        )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["clarification_needed"] is True
+    assert payload["sources"] == []
+    assert payload["chunks_used"] == 0
+    assert payload["answer"]
+
+
+def test_pending_clarification_combines_original_request_and_reply(monkeypatch):
+    monkeypatch.setattr(main, "_classify_query_clarity", lambda question, history: None)
+    history = [
+        main.ConversationTurn(role="user", content="Explain Spring"),
+        main.ConversationTurn(
+            role="assistant",
+            content="Do you mean the Spring Framework or the spring season?",
+            clarification_needed=True,
+        ),
+    ]
+    result = main.understand_query("Spring Framework in Java", history)
+    assert result["action"] == "answer"
+    assert "Original request: Explain Spring" in result["normalized_query"]
+    assert "User clarification: Spring Framework in Java" in result["normalized_query"]
+
+
+def test_yes_alone_does_not_resolve_a_two_option_clarification():
+    history = [
+        main.ConversationTurn(role="user", content="Explain Spring"),
+        main.ConversationTurn(
+            role="assistant",
+            content="Do you mean the Spring Framework or the spring season?",
+            clarification_needed=True,
+        ),
+    ]
+    result = main.understand_query("yes", history)
+    assert result["action"] == "clarify"
+    assert "specific option" in result["clarification_question"]
+
+
+def test_classifier_can_normalize_a_typo_before_retrieval(monkeypatch):
+    seen = {}
+    def fake_classifier(question, history):
+        seen["question"] = question
+        return {
+            "action": "answer",
+            "normalized_query": "Explain dependency injection in Spring Boot",
+            "clarification_question": None,
+        }
+    monkeypatch.setattr(main, "_classify_query_clarity", fake_classifier)
+    result = main.understand_query("Explane dependancy injection in Spring Boot", [])
+    assert seen["question"] == "Explane dependancy injection in Spring Boot"
+    assert result["action"] == "answer"
+    assert result["normalized_query"] == "Explain dependency injection in Spring Boot"
+
+
+def test_ambiguous_short_query_asks_one_specific_followup(monkeypatch):
+    monkeypatch.setattr(
+        main, "_classify_query_clarity",
+        lambda question, history: {
+            "action": "clarify",
+            "normalized_query": None,
+            "clarification_question": "Do you mean the Spring Framework in Java or the spring season?",
+        },
+    )
+    result = main.understand_query("Explain Spring", [])
+    assert result["action"] == "clarify"
+    assert result["clarification_question"].endswith("season?")
+
+
+def test_clear_short_query_proceeds_when_classifier_confirms_intent(monkeypatch):
+    monkeypatch.setattr(
+        main, "_classify_query_clarity",
+        lambda question, history: {
+            "action": "answer",
+            "normalized_query": "What is Java virtual machine?",
+            "clarification_question": None,
+        },
+    )
+    result = main.understand_query("What is JVM?", [])
+    assert result["action"] == "answer"
+    assert result["normalized_query"] == "What is Java virtual machine?"
+
+
+def test_classifier_failure_falls_back_for_non_obvious_short_query(monkeypatch):
+    monkeypatch.setattr(main, "_classify_query_clarity", lambda question, history: None)
+    result = main.understand_query("Explain Java collections", [])
+    assert result["action"] == "answer"
+    assert result["normalized_query"] == "Explain Java collections"
