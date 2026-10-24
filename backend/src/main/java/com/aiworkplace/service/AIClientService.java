@@ -11,6 +11,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.client.HttpStatusCodeException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.web.multipart.MultipartFile;
 
 import com.aiworkplace.entity.User;
@@ -93,14 +96,27 @@ public class AIClientService {
     }
 
     /**
-     * Forward the uploaded MultipartFile to FastAPI /ingest endpoint.
-     * Returns number of chunks created, or -1 on failure.
+     * Result of the synchronous upload -> extraction -> chunking -> embedding -> DB commit.
+     * A document is searchable only when indexed=true and chunksCreated is positive.
      */
+    public record IngestionResult(int chunksCreated, int httpStatus, String message) {
+        public boolean indexed() {
+            return httpStatus >= 200 && httpStatus < 300 && chunksCreated > 0;
+        }
+    }
+
     public int ingestDocument(MultipartFile file, Long userId) {
         return ingestDocument(file, userId, null);
     }
 
+    /** Compatibility wrapper for callers that only need a chunk count. */
     public int ingestDocument(MultipartFile file, Long userId, Long documentId) {
+        IngestionResult result = ingestDocumentResult(file, userId, documentId);
+        if (result.indexed()) return result.chunksCreated();
+        return result.httpStatus() == 422 ? 0 : -1;
+    }
+
+    public IngestionResult ingestDocumentResult(MultipartFile file, Long userId, Long documentId) {
         try {
             byte[] fileBytes = file.getBytes();
 
@@ -111,40 +127,64 @@ public class AIClientService {
             }
 
             MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-
-            // Wrap bytes in a named resource so FastAPI receives a proper file
             ByteArrayResource fileResource = new ByteArrayResource(fileBytes) {
                 @Override
                 public String getFilename() {
                     return file.getOriginalFilename();
                 }
             };
-
             body.add("file", fileResource);
-            if (userId != null)    body.add("user_id", userId.toString());
+            if (userId != null) body.add("user_id", userId.toString());
             if (documentId != null) body.add("document_id", documentId.toString());
 
             HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
-
             ResponseEntity<Map> response = restTemplate.postForEntity(
                 ragBaseUrl + "/ingest", requestEntity, Map.class);
 
-            if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null) {
+            if (response.getStatusCode().is2xxSuccessful() && response.getBody() != null) {
                 Map<String, Object> resp = response.getBody();
-                Boolean success = (Boolean) resp.getOrDefault("success", false);
-                if (Boolean.TRUE.equals(success)) {
-                    int chunks = (int) resp.getOrDefault("chunks_created", 0);
-                    log.info("Ingested {} chunks for document '{}' (user {})", chunks, file.getOriginalFilename(), userId);
-                    return chunks;
-                } else {
-                    log.warn("RAG ingest returned success=false: {}", resp.get("message"));
-                    return 0;
+                boolean success = Boolean.TRUE.equals(resp.get("success"));
+                Object rawChunks = resp.get("chunks_created");
+                int chunks = rawChunks instanceof Number number ? number.intValue() : 0;
+                String message = String.valueOf(resp.getOrDefault("message", ""));
+                if (success && chunks > 0) {
+                    log.info("Indexed {} chunks for document '{}' (user {})",
+                        chunks, file.getOriginalFilename(), userId);
+                    return new IngestionResult(chunks, response.getStatusCode().value(), message);
                 }
+                log.warn("RAG did not index file '{}': {}", file.getOriginalFilename(), message);
+                return new IngestionResult(0, 422, message.isBlank()
+                    ? "RAG returned success=false or zero searchable chunks." : message);
             }
+            return new IngestionResult(0, response.getStatusCode().value(),
+                "RAG returned an unexpected response without a confirmed index.");
+
+        } catch (HttpStatusCodeException e) {
+            int status = e.getStatusCode().value();
+            String details = extractRagError(e.getResponseBodyAsString());
+            log.warn("RAG ingestion HTTP {} for '{}': {}", status, file.getOriginalFilename(), details);
+            return new IngestionResult(status == 422 ? 0 : -1, status, details);
         } catch (Exception e) {
-            log.error("Ingest error for file '{}': {}", file.getOriginalFilename(), e.getMessage());
+            log.error("RAG ingestion failed for '{}': {}", file.getOriginalFilename(), e.getMessage());
+            return new IngestionResult(-1, 503,
+                "RAG service could not confirm indexing. Check service health, shared RAG_API_KEY, and logs.");
         }
-        return -1;
+    }
+
+    private String extractRagError(String responseBody) {
+        if (responseBody == null || responseBody.isBlank()) {
+            return "RAG request failed without an error body.";
+        }
+        try {
+            JsonNode root = new ObjectMapper().readTree(responseBody);
+            for (String key : List.of("detail", "message", "error")) {
+                String value = root.path(key).asText("");
+                if (!value.isBlank()) return value;
+            }
+        } catch (Exception ignored) {
+            // Keep a bounded response body when the RAG service did not return JSON.
+        }
+        return responseBody.length() > 500 ? responseBody.substring(0, 500) : responseBody;
     }
 
     /**
