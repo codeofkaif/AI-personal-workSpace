@@ -221,7 +221,7 @@ cp .env.example .env
 ### What the RAG service now uses
 
 - **Embeddings:** intfloat/multilingual-e5-small (384 dimensions), with the required query: and passage: prefixes. It is a multilingual retrieval model; language support does not guarantee equal quality for every language. See the [model card](https://huggingface.co/intfloat/multilingual-e5-small).
-- **Chunking:** paragraph-aware token chunks, configurable with CHUNK_SIZE_TOKENS (default 350) and CHUNK_OVERLAP_TOKENS (default 50). PDF page numbers are retained.
+- **Chunking:** paragraph-aware token chunks, configurable with CHUNK_SIZE_TOKENS (default 350) and CHUNK_OVERLAP_TOKENS (default 50). PDF page numbers are retained. Context assembly deduplicates chunks and obeys RAG_CONTEXT_TOKEN_BUDGET (default 1800) and RAG_CONTEXT_CHUNKS (default 4).
 - **Retrieval:** dense pgvector search and PostgreSQL full-text search, fused using Reciprocal Rank Fusion.
 - **Reranking:** optional local cross-encoder, configured with RERANK_ENABLED and RERANKER_MODEL_NAME. The configured multilingual MS MARCO cross-encoder was trained using translated ranking data; verify performance on this project's own Hindi/Hinglish and English test set. See [its model card](https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1).
 - **Generation:** Ollama with qwen3:4b-instruct-2507-q4_K_M, temperature=0.1, num_ctx=4096, bounded output tokens, and a keep-warm interval. These are starting defaults; benchmark your actual hardware and questions before changing them.
@@ -248,7 +248,7 @@ The embedding model and chunking strategy changed. Old vectors must not be mixed
 
 5. Restart the RAG service and test representative personal and college-document queries.
 
-The script replaces each document's chunks atomically and reports missing files rather than silently dropping them. If a source file is missing, re-upload it through the application before proceeding. Scanned PDFs still need OCR; the current parser reports unreadable PDFs rather than claiming that they were indexed.
+The script replaces each document's chunks atomically and reports missing files rather than silently dropping them. If a source file is missing, re-upload it through the application before proceeding. Scanned PDFs can use optional local OCR through PyMuPDF + Tesseract. On macOS, install the Tesseract binary (for example, brew install tesseract); then verify its language packs with tesseract --list-langs. Set OCR_LANG=eng+hin only when both language packs are installed. If Tesseract is unavailable or OCR returns no text, ingestion reports that no readable text was indexed rather than claiming success.
 
 ### Regression tests
 
