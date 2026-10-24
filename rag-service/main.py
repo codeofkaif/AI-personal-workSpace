@@ -126,18 +126,18 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
         "id": user_id,
         "name": "User",
         "email": "",
-        "role": "STUDENT",
-        "department": "Computer Science & Engineering",
-        "roll_number": f"CS2026-{user_id or 1:03d}",
-        "cgpa": 8.5,
-        "placement_score": 85,
-        "placement_category": "STRONG",
-        "college": "Babu Banarasi Das University"
+        "role": "UNKNOWN",
+        "department": "Not available",
+        "roll_number": None,
+        "cgpa": None,
+        "placement_score": None,
+        "placement_category": "UNKNOWN",
+        "college": "Not available"
     }
 
     if passed_profile and isinstance(passed_profile, dict):
+        # Treat passed profile as a hint only; verified DB fields below take precedence.
         profile.update({k: v for k, v in passed_profile.items() if v is not None})
-        return profile
 
     if not user_id:
         return profile
@@ -163,29 +163,17 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
                 if row[6]:
                     profile["college"] = row[6]
 
-            # Compute placement score for students
-            if profile["role"] == "STUDENT":
-                cur.execute("""
-                    SELECT COUNT(*) FROM documents 
-                    WHERE user_id = %s AND (LOWER(title) LIKE '%%resume%%' OR LOWER(title) LIKE '%%cv%%' OR LOWER(title) LIKE '%%kaif%%')
-                """, (user_id,))
-                has_resume = (cur.fetchone()[0] or 0) > 0
-
-                cur.execute("SELECT COUNT(*) FROM tasks WHERE user_id = %s AND status = 'COMPLETED'", (user_id,))
-                tasks_done = cur.fetchone()[0] or 0
-
-                cur.execute("SELECT COUNT(*) FROM notes WHERE user_id = %s", (user_id,))
-                notes_cnt = cur.fetchone()[0] or 0
-
-                score = 30
-                if has_resume: score += 35
-                if tasks_done >= 1: score += 20
-                if notes_cnt >= 1: score += 15
-                score = min(100, score)
-
-                profile["placement_score"] = score
-                profile["placement_category"] = "STRONG" if score >= 75 else ("MODERATE" if score >= 50 else "NEEDS_PREPARATION")
-                profile["has_resume"] = has_resume
+            # Resume status is factual; do not infer a numeric placement score from activity counts.
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM documents
+                    WHERE user_id = %s
+                      AND (LOWER(title) LIKE '%%resume%%' OR LOWER(title) LIKE '%%cv%%')
+                )
+            """, (user_id,))
+            profile["has_resume"] = bool(cur.fetchone()[0])
+            profile["placement_score"] = None
+            profile["placement_category"] = "UNKNOWN"
 
             cur.close()
             conn.close()
