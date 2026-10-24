@@ -553,18 +553,25 @@ async def query_ai(req: QueryRequest):
         # Profile data is also injected via user_context in generate_answer.
 
         if re.search(r'\b(mera placement|my placement|placement score|placement standing|placement status)\b', q_clean):
-            has_res = user_profile.get('has_resume', True)
-            res_tag = "Uploaded & Verified ✅" if has_res else "Upload Pending ⚠️"
+            has_res = bool(user_profile.get('has_resume', False))
+            res_tag = "Resume record found in your documents" if has_res else "No resume/CV record found in your documents"
+            score = user_profile.get('placement_score')
+            if score is None:
+                placement_text = "A verified numeric placement-readiness score is not stored in the current database, so I will not invent one."
+                category_text = "Placement category: Not assessed"
+            else:
+                placement_text = f"Verified placement-readiness score: {score}%."
+                category_text = f"Category: {user_profile.get('placement_category', 'Not specified')}."
             return QueryResponse(
                 answer=(
-                    f"🎯 **Aapka Placement Readiness Summary:**\n\n"
-                    f"• 📊 **Readiness Score:** **{user_profile['placement_score']}%**\n"
-                    f"• 🌟 **Placement Category:** **{user_profile['placement_category']} Category**\n"
-                    f"• 📄 **Resume Status:** {res_tag}\n"
-                    f"• 🏢 **Department:** {user_profile['department']}\n\n"
-                    f"🏆 *Aap Tier-1 campus placement drives aur internship drives ke liye eligible hain.*"
+                    f"🎯 **Placement Profile Summary**\n\n"
+                    f"• {placement_text}\n"
+                    f"• {category_text}\n"
+                    f"• Resume status: {res_tag}\n"
+                    f"• Department: {user_profile.get('department', 'Not available')}\n\n"
+                    "Note: resume presence alone does not establish placement eligibility."
                 ),
-                sources=["Placement Cell Records"],
+                sources=["User Profile"],
                 chunks_used=1
             )
 
