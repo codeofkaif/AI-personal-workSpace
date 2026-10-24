@@ -3,9 +3,9 @@ server.port=8080
 spring.application.name=ai-personal-workspace
 
 # ===== PostgreSQL Database =====
-spring.datasource.url=${DB_URL:jdbc:postgresql://localhost:5432/ai_workspace}
-spring.datasource.username=${DB_USER:kaifkhan}
-spring.datasource.password=${DB_PASSWORD:}
+spring.datasource.url=jdbc:postgresql://localhost:5432/ai_workspace
+spring.datasource.username=kaifkhan
+spring.datasource.password=YOUR_DB_PASSWORD
 spring.datasource.driver-class-name=org.postgresql.Driver
 
 # ===== JPA / Hibernate =====

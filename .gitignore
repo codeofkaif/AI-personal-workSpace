@@ -41,6 +41,10 @@ backend/uploads/*
 uploads/*
 !uploads/.gitignore
 
+# --- Spring Boot Secrets (local config with passwords) ---
+backend/src/main/resources/application.properties
+!backend/src/main/resources/application.properties.example
+
 # --- Python & FastAPI (RAG Service) ---
 rag-service/evaluation/latest-report.json
 __pycache__/
