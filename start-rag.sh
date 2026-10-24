@@ -14,6 +14,14 @@ elif [ -d "$HOME/miniconda3/bin" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load local environment overrides from the repository root (never commit .env).
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
 cd "$SCRIPT_DIR/rag-service"
 
 # Use or create virtual environment to avoid PEP 668 externally managed environment issues
