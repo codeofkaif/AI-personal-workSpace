@@ -1,31 +1,26 @@
 # 🎓 AI Personal Workspace (Campus Copilot)
 
-> An intelligent, role-aware, full-stack Academic Workspace & Campus Copilot powered by **React 19**, **Spring Boot 3**, and a **FastAPI RAG (Retrieval-Augmented Generation) Engine**.
+> **AI-powered personal and institutional workspace for college-scoped knowledge, private user documents, productivity, and source-grounded AI assistance.**
+
+[![React](https://img.shields.io/badge/Frontend-React%2019%20%2B%20Vite-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![Spring Boot](https://img.shields.io/badge/Backend-Spring%20Boot%203.3.5-6DB33F?logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
+[![FastAPI](https://img.shields.io/badge/AI%20Service-FastAPI%20%2B%20PyTorch-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL%20%2B%20pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
 ---
 
 ## 🌟 Overview
 
-**AI Personal Workspace** is an all-in-one academic and institutional workspace designed for colleges and universities. It bridges the gap between campus administration, faculty, and students by combining role-based workspaces with an AI assistant capable of answering questions from syllabi, campus notices, lecture notes, and official university circulars.
+**AI Personal Workspace** is a unified academic workspace designed for colleges and universities. It bridges the gap between campus administration, faculty, and students by combining role-based workspaces with an AI assistant capable of answering questions from syllabi, campus notices, lecture notes, and official university circulars.
+
+The core principle of the platform:
+> **College knowledge is shared across permitted college members, while personal knowledge remains strictly private to the user.**
 
 ---
 
-## ⚡ Key Features
+## 🏛️ System Architecture & Four Pillars
 
-- 🤖 **Context-Aware AI Assistant (RAG)**: Ask questions directly to your personal documents, department notices, or academic schedules. Built-in query grounding prevents hallucinations.
-- 🔐 **Role-Based Access Control (RBAC)**: Custom dashboard and specialized tools for:
-  - **Student**: Task planner, lecture notes editor, AI study buddy, timetable, notices.
-  - **Faculty**: Student analytics, subject-wise document distribution, announcements.
-  - **HOD (Head of Department)**: Departmental staff monitoring, branch notices, performance reports.
-  - **Dean**: Institution-wide circulars, inter-departmental analytics, university policies.
-- 📄 **Smart Document Hub**: Upload and process PDFs, DOCX, and TXT files with real-time vector embeddings and semantic search.
-- 📅 **Academic Calendar & Schedule**: Organize classes, exams, submission deadlines, and campus events.
-- 📝 **Rich Notes & Task Tracker**: Markdown-supported personal notes and kanban-style task tracking.
-- 📢 **College Notice Board**: Real-time broadcasts filtered by department and target audience.
-
----
-
-## 🏗️ Architecture & Tech Stack
+The system is built upon four robust, decoupled pillars:
 
 ```text
 ┌────────────────────────────────────────────────────────┐
@@ -47,13 +42,52 @@
 └────────────────────────────────────────────────────────┘
 ```
 
-### 💻 Technologies Used
+1. **Frontend (React 19 + Vite + Tailwind CSS)**: Intuitive, high-performance web interface tailored by role (Student, Faculty, HOD, Dean).
+2. **Backend (Spring Boot 3.3.5 + Java 21)**: Enterprise-grade REST API, JWT authentication, role-based authorization, database transactions, and business logic.
+3. **AI / RAG Service (FastAPI + Python 3.10+)**: Text extraction, semantic chunking, vector embeddings (`all-MiniLM-L6-v2`), pgvector similarity retrieval, and LLM answer generation with citations.
+4. **Database (PostgreSQL + pgvector)**: Relational application storage combined with native vector similarity search.
 
-| Tier | Technologies |
-| :--- | :--- |
-| **Frontend** | React 19, Vite, Tailwind CSS, Lucide React, React Router v7 |
-| **Backend** | Spring Boot 3.3.5, Java 21, Spring Security (JWT), Spring Data JPA, PostgreSQL |
-| **AI / RAG** | FastAPI, Python 3.10+, Sentence-Transformers (`all-MiniLM-L6-v2`), pgvector, Uvicorn |
+---
+
+## 📐 Architecture & Design Documentation
+
+Detailed architectural blueprints are maintained in the [`docs/architecture/`](docs/architecture/) folder:
+
+- **Project High-Level Design (HLD)**: [`ProjectHLD.png`](docs/architecture/ProjectHLD.png)
+- **Frontend Architecture & LLD**: [`frontEnd_design.png`](docs/architecture/frontEnd_design.png)
+- **Backend Architecture & LLD**: [`BackendDesign.png`](docs/architecture/BackendDesign.png)
+- **AI & RAG Pipeline Design**: [`Ai:RAG_Design.png`](docs/architecture/Ai:RAG_Design.png)
+- **Database Schema & Entity Relations**: [`DataBaseDesign.png`](docs/architecture/DataBaseDesign.png)
+
+---
+
+## ⚡ Key Features
+
+- 🤖 **Context-Aware AI Assistant (RAG)**: Ask questions directly against uploaded documents, campus circulars, and course syllabi with grounded answers and source citations.
+- 🔐 **Role-Based Access Control (RBAC)**:
+  - **Student**: AI study buddy, personal notes, course document Q&A, timetable, notice board.
+  - **Faculty**: Class notices, subject document distribution, student attendance & performance analytics.
+  - **HOD (Head of Department)**: Departmental staff overview, branch broadcasts, student performance monitoring.
+  - **Dean**: College-wide circulars, inter-departmental analytics, institutional governance.
+- 📄 **Smart Document Hub**: Ingestion pipeline supporting PDF, DOCX, and TXT files with background chunking and vector indexing.
+- 📅 **Academic Calendar**: Visual schedule for classes, exams, submission deadlines, and university events.
+- 📝 **Rich Markdown Notes & Tasks**: Personal notes editor with formatting tools and a task tracker.
+- 📢 **College Notice Board**: Real-time broadcasts filtered by college, department, and target audience.
+
+---
+
+## 🔒 Data Isolation & Security Model
+
+Data access strictly enforces tenant and user isolation:
+
+```text
+Private Data   ──► Isolated by user_id
+College Data   ──► Isolated by college_id
+```
+
+- **Allowed**: Current user's private documents + User's college shared documents.
+- **Blocked**: Documents from other colleges or other users' private workspaces.
+- Filtering is enforced on both the Spring Boot API layer and the FastAPI vector retrieval queries.
 
 ---
 
@@ -61,14 +95,16 @@
 
 ```text
 AIWorkPlace/
-├── src/                    # Frontend source code (React + Tailwind)
+├── docs/                   # Architectural diagrams and design specifications
+│   └── architecture/       # HLD, LLD, and Database design diagrams
+├── src/                    # Frontend source code (React 19 + Tailwind)
 │   ├── api/                # Centralized API client & JWT token management
 │   ├── components/         # Reusable UI components & modals
 │   ├── context/            # Auth and application state contexts
 │   ├── layouts/            # Dashboard layout and navigation sidebars
 │   └── pages/              # Role pages (Dashboard, AIChat, Dean, Hod, etc.)
 ├── backend/                # Spring Boot REST API
-│   ├── src/main/java/      # Controllers, Services, Repositories, Security
+│   ├── src/main/java/      # Controllers, Services, Entities, Repositories, Security
 │   ├── src/main/resources/ # application.properties configuration
 │   └── pom.xml             # Maven dependencies
 ├── rag-service/            # FastAPI Python RAG microservice
@@ -86,19 +122,16 @@ AIWorkPlace/
 
 ### 📋 Prerequisites
 
-Ensure you have the following installed on your machine:
-- **Node.js** (v18 or higher) & **npm**
+- **Node.js** (v18+) & **npm**
 - **Java Development Kit (JDK 21)**
 - **Maven** (v3.8+)
 - **Python** (v3.10+)
-- **PostgreSQL** (v14+ recommended with `pgvector` extension)
+- **PostgreSQL** (v14+ with `pgvector` extension)
 - *(Optional)* **Ollama** (for local offline LLM generation)
 
 ---
 
 ### 1. Database Setup
-
-Create a PostgreSQL database named `ai_workspace`:
 
 ```sql
 CREATE DATABASE ai_workspace;
@@ -150,7 +183,7 @@ mvn clean spring-boot:run
 
 ---
 
-### 4. Run the React Frontend (Port 5173 / 3000)
+### 4. Run the React Frontend (Port 5173)
 
 From the project root:
 ```bash
@@ -161,7 +194,7 @@ npm install
 npm run dev
 ```
 
-Open your browser and navigate to `http://localhost:5173` (or the port displayed in your terminal).
+Open `http://localhost:5173` in your browser.
 
 ---
 
@@ -182,4 +215,4 @@ cp .env.example .env
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License.
