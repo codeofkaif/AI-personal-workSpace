@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="AI Personal Workspace — RAG Service",
     description="FastAPI service for document ingestion, embeddings, and role-aware AI Q&A",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -657,7 +657,8 @@ def health_check():
         )
 
     ready = database_ok and ollama_api_ok and configured_model_ok
-    degraded = (not ready) or (OCR_ENABLED and not tesseract_available)
+    # OCR is an optional document-type capability: text-based RAG can remain ready without it.
+    degraded = not ready
     return {
         "status": "degraded" if degraded else "healthy",
         "service": "RAG Service",
