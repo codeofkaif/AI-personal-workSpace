@@ -4,7 +4,7 @@
  */
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080';
-const RAG_URL  = 'http://localhost:8000';
+const RAG_URL  = import.meta.env.VITE_RAG_URL || 'http://localhost:8000';
 
 // ── Token Management ─────────────────────────────────────────────────────────
 export const tokenManager = {

@@ -50,7 +50,7 @@ pip install -r requirements.txt -q
 
 # FastAPI server start karo (venv ko reload watching se exclude kiya taaki bar bar restart na ho)
 UVICORN_ARGS=()
-if [[ "${RAG_ENV:-development}" != "production" && "${RAG_RELOAD:-true}" == "true" ]]; then
+if [[ "${RAG_ENV:-development}" != "production" && "${RAG_RELOAD:-false}" == "true" ]]; then
     UVICORN_ARGS+=(--reload --reload-include "*.py")
 fi
 
