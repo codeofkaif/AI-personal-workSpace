@@ -77,6 +77,7 @@ public class DocumentService {
             .fileType(file.getContentType())
             .fileSize(file.getSize())
             .user(admin)
+            .college(admin.getCollege())
             .isCollegeDoc(true)
             .build();
         doc = documentRepository.save(doc);
@@ -105,6 +106,12 @@ public class DocumentService {
         Document doc = documentRepository.findById(id)
             .orElseThrow(() -> new RuntimeException("Document not found"));
         if (!doc.getUser().getId().equals(userId)) throw new RuntimeException("Unauthorized");
+        // Purge chunks first so a failed RAG deletion does not leave the index inconsistent.
+        if (!aiClientService.deleteDocumentChunks(id, userId)) {
+            throw new IllegalStateException(
+                "Document index could not be deleted. Please retry when the AI service is available."
+            );
+        }
         documentRepository.delete(doc);
     }
 

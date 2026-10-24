@@ -25,6 +25,9 @@ public class AIClientService {
     @Value("${app.rag.base-url}")
     private String ragBaseUrl;
 
+    @Value("${app.rag.api-key:}")
+    private String ragApiKey;
+
     private final RestTemplate restTemplate;
 
     /** Send question to RAG /query endpoint with full user identity profile */
@@ -44,15 +47,26 @@ public class AIClientService {
                 profile.put("name", user.getName());
                 profile.put("email", user.getEmail());
                 profile.put("role", user.getRole().name());
-                profile.put("department", user.getDepartment() != null ? user.getDepartment() : "Computer Science & Engineering");
-                profile.put("roll_number", user.getRollNumber() != null ? user.getRollNumber() : "CS2026-" + user.getId());
-                profile.put("cgpa", user.getCgpa() != null ? user.getCgpa() : 8.5);
-                profile.put("college", user.getCollege() != null ? user.getCollege().getName() : "Babu Banarasi Das University");
+                if (user.getDepartment() != null && !user.getDepartment().isBlank()) {
+                    profile.put("department", user.getDepartment());
+                }
+                if (user.getRollNumber() != null && !user.getRollNumber().isBlank()) {
+                    profile.put("roll_number", user.getRollNumber());
+                }
+                if (user.getCgpa() != null) {
+                    profile.put("cgpa", user.getCgpa());
+                }
+                if (user.getCollege() != null && user.getCollege().getName() != null) {
+                    profile.put("college", user.getCollege().getName());
+                }
                 body.put("user_profile", profile);
             }
 
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
+            if (ragApiKey != null && !ragApiKey.isBlank()) {
+                headers.set("X-RAG-API-Key", ragApiKey);
+            }
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
 
             ResponseEntity<Map> response = restTemplate.postForEntity(
@@ -92,6 +106,9 @@ public class AIClientService {
 
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+            if (ragApiKey != null && !ragApiKey.isBlank()) {
+                headers.set("X-RAG-API-Key", ragApiKey);
+            }
 
             MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
 
@@ -130,11 +147,41 @@ public class AIClientService {
         return -1;
     }
 
+    /**
+     * Remove vectors for an owned document before deleting its relational record.
+     * The RAG service verifies ownership independently; the shared service key never reaches the browser.
+     */
+    public boolean deleteDocumentChunks(Long documentId, Long userId) {
+        if (documentId == null || userId == null) {
+            return false;
+        }
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            if (ragApiKey != null && !ragApiKey.isBlank()) {
+                headers.set("X-RAG-API-Key", ragApiKey);
+            }
+            HttpEntity<Void> request = new HttpEntity<>(headers);
+            String url = ragBaseUrl + "/documents/" + documentId + "?user_id=" + userId;
+            ResponseEntity<Map> response = restTemplate.exchange(
+                url, HttpMethod.DELETE, request, Map.class);
+            return response.getStatusCode().is2xxSuccessful()
+                && response.getBody() != null
+                && Boolean.TRUE.equals(response.getBody().get("success"));
+        } catch (Exception e) {
+            log.warn("Could not purge RAG chunks for document {} (user {}): {}", documentId, userId, e.getMessage());
+            return false;
+        }
+    }
+
     /** Check if FastAPI RAG service is reachable */
     public String getStatus() {
         try {
             ResponseEntity<Map> response = restTemplate.getForEntity(ragBaseUrl + "/health", Map.class);
-            return response.getStatusCode().is2xxSuccessful() ? "ONLINE" : "DEGRADED";
+            if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
+                return "DEGRADED";
+            }
+            Object status = response.getBody().get("status");
+            return "healthy".equalsIgnoreCase(String.valueOf(status)) ? "ONLINE" : "DEGRADED";
         } catch (Exception e) {
             return "OFFLINE";
         }

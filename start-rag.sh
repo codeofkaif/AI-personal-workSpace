@@ -14,6 +14,14 @@ elif [ -d "$HOME/miniconda3/bin" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load local environment overrides from the repository root (never commit .env).
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
 cd "$SCRIPT_DIR/rag-service"
 
 # Use or create virtual environment to avoid PEP 668 externally managed environment issues
@@ -41,4 +49,9 @@ echo ""
 pip install -r requirements.txt -q
 
 # FastAPI server start karo (venv ko reload watching se exclude kiya taaki bar bar restart na ho)
-exec python3 -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload --reload-include "*.py"
+UVICORN_ARGS=()
+if [[ "${RAG_ENV:-development}" != "production" && "${RAG_RELOAD:-true}" == "true" ]]; then
+    UVICORN_ARGS+=(--reload --reload-include "*.py")
+fi
+
+exec python3 -m uvicorn main:app --host "${RAG_HOST:-127.0.0.1}" --port "${RAG_PORT:-8000}" "${UVICORN_ARGS[@]}"

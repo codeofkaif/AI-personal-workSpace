@@ -11,6 +11,14 @@ export PATH=$JAVA_HOME/bin:$PATH
 
 # backend/ folder mein jao
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load local environment overrides from the repository root (never commit .env).
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
 cd "$SCRIPT_DIR/backend"
 
 echo ""
