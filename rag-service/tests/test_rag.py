@@ -111,3 +111,27 @@ def test_embedding_failure_is_not_converted_to_zero_vector(monkeypatch):
         assert "model weights missing" in str(exc)
     else:
         raise AssertionError("Embedding failure must propagate; zero vectors are unsafe.")
+
+def test_context_selector_deduplicates_and_respects_chunk_count(monkeypatch):
+    monkeypatch.setattr(main, "get_model", lambda: SimpleNamespace(tokenizer=WhitespaceTokenizer()))
+    monkeypatch.setattr(main, "RAG_CONTEXT_CHUNKS", 2)
+    monkeypatch.setattr(main, "RAG_CONTEXT_TOKEN_BUDGET", 100)
+    candidates = [
+        {"id": 1, "content": "same evidence", "filename": "a.pdf"},
+        {"id": 2, "content": "same evidence", "filename": "a.pdf"},
+        {"id": 3, "content": "different evidence", "filename": "b.pdf"},
+    ]
+    selected = main.select_context_items(candidates)
+    assert [item["id"] for item in selected] == [1, 3]
+
+
+def test_context_selector_obeys_token_budget(monkeypatch):
+    monkeypatch.setattr(main, "get_model", lambda: SimpleNamespace(tokenizer=WhitespaceTokenizer()))
+    monkeypatch.setattr(main, "RAG_CONTEXT_CHUNKS", 8)
+    monkeypatch.setattr(main, "RAG_CONTEXT_TOKEN_BUDGET", 64)
+    candidates = [
+        {"id": 1, "content": " ".join(f"a{i}" for i in range(40)), "filename": "a.pdf"},
+        {"id": 2, "content": " ".join(f"b{i}" for i in range(40)), "filename": "b.pdf"},
+    ]
+    selected = main.select_context_items(candidates)
+    assert sum(len(item["content"].split()) for item in selected) <= 64
