@@ -716,17 +716,16 @@ def ingest_document(
                 )
             elif suffix == ".pdf":
                 message += " If this is a scanned/image-only PDF, verify Tesseract OCR and the required language packs."
-            return IngestResponse(success=False, message=message, chunks_created=0)
+            raise HTTPException(status_code=422, detail=message)
         chunk_records = [
             (page_number, chunk)
             for page_number, page_text in page_texts
             for chunk in chunk_text(page_text)
         ]
         if not chunk_records:
-            return IngestResponse(
-                success=False,
-                message=f"No non-empty text chunks could be produced for '{filename}'; the document was not indexed.",
-                chunks_created=0
+            raise HTTPException(
+                status_code=422,
+                detail=f"No non-empty text chunks could be produced for '{filename}'; the document was not indexed."
             )
 
         clean_chunks = [chunk.replace("\x00", "").strip() for _, chunk in chunk_records]
