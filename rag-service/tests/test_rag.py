@@ -297,6 +297,13 @@ def test_new_document_is_immediately_retrievable_from_database(monkeypatch):
         seen_context["items"] = list(context_items)
         return f"The indexed marker is {marker}. [Source: fresh.txt]"
 
+    monkeypatch.setattr(
+        main, "_classify_query_clarity",
+        lambda question, history: {
+            "action": "answer", "normalized_query": question,
+            "clarification_question": None,
+        },
+    )
     monkeypatch.setattr(main, "generate_answer", fake_generate)
     headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
 
@@ -328,3 +335,81 @@ def test_new_document_is_immediately_retrievable_from_database(monkeypatch):
         assert marker in query_json["answer"]
         assert query_json["sources"] == ["fresh.txt"]
         assert seen_context["items"][0]["content"] == f"Private test marker: {marker}."
+
+
+
+def test_ambiguous_query_returns_followup_before_retrieval(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Embedding or retrieval must not run before clarification")
+
+    monkeypatch.setattr(main, "fetch_user_profile", forbidden)
+    monkeypatch.setattr(main, "get_embedding", forbidden)
+    monkeypatch.setattr(main, "retrieve_context", forbidden)
+    headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
+
+    with TestClient(main.app) as client:
+        result = client.post(
+            "/query",
+            json={"question": "Explain this", "user_id": 42, "scope": "Personal Only"},
+            headers=headers,
+        )
+    assert result.status_code == 200, result.text
+    payload = result.json()
+    assert payload["clarification_needed"] is True
+    assert payload["sources"] == []
+    assert payload["chunks_used"] == 0
+    assert payload["answer"]
+
+
+def test_pending_clarification_uses_original_question():
+    history = [
+        main.ConversationTurn(role="user", content="Explain Spring"),
+        main.ConversationTurn(
+            role="assistant",
+            content="Do you mean Spring Framework or the season?",
+            clarification_needed=True,
+        ),
+    ]
+    result = main.understand_query("Spring Framework in Java", history)
+    assert result["action"] == "answer"
+    assert "Original request: Explain Spring" in result["normalized_query"]
+    assert "User clarification: Spring Framework in Java" in result["normalized_query"]
+
+
+def test_classifier_normalizes_misspelled_clear_question(monkeypatch):
+    seen = {}
+    def fake_classifier(question, history):
+        seen["question"] = question
+        return {
+            "action": "answer",
+            "normalized_query": "Explain dependency injection in Spring Boot",
+            "clarification_question": None,
+        }
+    monkeypatch.setattr(main, "_classify_query_clarity", fake_classifier)
+    result = main.understand_query("Explane dependancy injection in spring boot", [])
+    assert seen["question"] == "Explane dependancy injection in spring boot"
+    assert result["action"] == "answer"
+    assert result["normalized_query"] == "Explain dependency injection in Spring Boot"
+
+
+def test_classifier_requests_followup_for_ambiguous_query(monkeypatch):
+    monkeypatch.setattr(
+        main, "_classify_query_clarity",
+        lambda question, history: {
+            "action": "clarify",
+            "normalized_query": None,
+            "clarification_question": "Do you mean Spring Framework or the spring season?",
+        },
+    )
+    result = main.understand_query("Tell me about spring please", [])
+    assert result["action"] == "clarify"
+    assert "Spring Framework" in result["clarification_question"]
+
+
+def test_clear_long_query_passes_through_if_classifier_is_unavailable(monkeypatch):
+    monkeypatch.setattr(main, "_classify_query_clarity", lambda question, history: None)
+    result = main.understand_query("Explain how PostgreSQL full text search complements vector retrieval in RAG", [])
+    assert result["action"] == "answer"
+    assert "PostgreSQL" in result["normalized_query"]
