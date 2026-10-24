@@ -363,6 +363,17 @@ def test_upload_then_immediate_query_retrieves_the_new_database_chunk(monkeypatc
 
 
 
+def test_conversation_history_is_bounded_to_most_recent_eight_turns():
+    history = [
+        main.ConversationTurn(role="user", content=f"Question {index}")
+        for index in range(10)
+    ]
+    normalized = main._history_as_dicts(history)
+    assert len(normalized) == 8
+    assert normalized[0]["content"] == "Question 2"
+    assert normalized[-1]["content"] == "Question 9"
+
+
 def test_obvious_unclear_query_returns_followup_without_db_embedding_or_generation(monkeypatch):
     from fastapi.testclient import TestClient
 
