@@ -4,7 +4,7 @@ Handles: Document Ingestion, Embedding, Vector Search, LLM Answer Generation
 Trained for User Identity & Role Awareness ("me" / "mera" = authenticated user profile)
 """
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -51,6 +51,11 @@ class IngestResponse(BaseModel):
     message: str
     document_id: Optional[str] = None
     chunks_created: int = 0
+
+class DeleteResponse(BaseModel):
+    success: bool
+    document_id: int
+    chunks_deleted: int
 
 # ── Global SentenceTransformer Model ─────────────────────────────────────────
 
@@ -500,7 +505,7 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
 @app.middleware("http")
 async def protect_internal_rag_endpoints(request: Request, call_next):
     """Require the shared backend/service key when configured; fail closed in production."""
-    if request.url.path in {"/query", "/ingest"}:
+    if request.url.path in {"/query", "/ingest"} or request.url.path.startswith("/documents/"):
         if RAG_ENV == "production" and not RAG_API_KEY:
             return JSONResponse(status_code=503, content={"detail": "RAG_API_KEY must be configured in production."})
         if RAG_API_KEY and not hmac.compare_digest(request.headers.get("X-RAG-API-Key", ""), RAG_API_KEY):
@@ -619,6 +624,38 @@ async def ingest_document(
     finally:
         if conn:
             conn.close()
+
+@app.delete("/documents/{document_id}", response_model=DeleteResponse)
+def delete_document_chunks(
+    document_id: int,
+    user_id: int = Query(..., gt=0)
+):
+    """Delete indexed chunks only after verifying the document owner from PostgreSQL."""
+    conn = get_db_connection()
+    if conn is None:
+        raise HTTPException(status_code=503, detail="RAG database is unavailable.")
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM documents WHERE id = %s FOR UPDATE", (document_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Document record not found.")
+        if int(row[0]) != int(user_id):
+            raise HTTPException(status_code=403, detail="User does not own this document.")
+        cur.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        return DeleteResponse(success=True, document_id=document_id, chunks_deleted=deleted)
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.exception("Document chunk deletion failed for id=%s", document_id)
+        raise HTTPException(status_code=500, detail="Could not delete the document index.") from e
+    finally:
+        conn.close()
 
 @app.post("/query", response_model=QueryResponse)
 async def query_ai(req: QueryRequest):
