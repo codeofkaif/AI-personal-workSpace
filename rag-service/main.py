@@ -102,12 +102,17 @@ def get_db_connection():
     try:
         import psycopg2
         conn = psycopg2.connect(
-            host="localhost",
-            port=5432,
-            database="ai_workspace",
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", "5432")),
+            database=os.getenv("DB_NAME", "ai_workspace"),
             user=os.getenv("DB_USER", "kaifkhan"),
             password=os.getenv("DB_PASSWORD", "")
         )
+        try:
+            from pgvector.psycopg2 import register_vector
+            register_vector(conn)
+        except Exception as e:
+            logger.warning("Could not register pgvector adapter: %s", e)
         return conn
     except Exception as e:
         logger.error(f"DB connection failed: {e}")
