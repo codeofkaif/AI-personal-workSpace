@@ -55,7 +55,7 @@ class IngestResponse(BaseModel):
 # ── Global SentenceTransformer Model ─────────────────────────────────────────
 
 # Model and vector-column dimensions must match. A model change requires re-embedding all chunks.
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "intfloat/multilingual-e5-small")
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
 LEGACY_EMBEDDING_MODEL_NAME = os.getenv("LEGACY_EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
 if EMBEDDING_DIMENSION != 384:
@@ -69,7 +69,7 @@ OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.85"))
 RAG_CANDIDATE_K = int(os.getenv("RAG_CANDIDATE_K", "20"))
 RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.10"))
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() in {"1", "true", "yes"}
-RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
 RAG_CANDIDATE_K = min(50, max(1, RAG_CANDIDATE_K))
 RAG_API_KEY = os.getenv("RAG_API_KEY", "")
 RAG_ENV = os.getenv("RAG_ENV", "development").lower()
