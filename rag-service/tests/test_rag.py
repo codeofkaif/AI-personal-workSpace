@@ -1,4 +1,5 @@
 from pathlib import Path
+from io import BytesIO
 import sys
 from types import SimpleNamespace
 
@@ -138,3 +139,35 @@ def test_context_selector_obeys_token_budget(monkeypatch):
     ]
     selected = main.select_context_items(candidates)
     assert sum(len(item["content"].split()) for item in selected) <= 64
+
+
+
+def test_ollama_health_requires_exact_configured_model_tag():
+    assert main._ollama_model_available(
+        [{"name": "qwen3.5:9b-q4_K_M", "model": "qwen3.5:9b-q4_K_M"}],
+        "qwen3.5:9b-q4_K_M",
+    )
+    assert not main._ollama_model_available(
+        [{"name": "qwen3:4b-instruct-2507-q4_K_M"}],
+        "qwen3.5:9b-q4_K_M",
+    )
+    assert not main._ollama_model_available([], "qwen3.5:9b-q4_K_M")
+
+
+def test_scan_pdf_without_extractable_text_is_never_reported_as_indexed(monkeypatch):
+    from fastapi import HTTPException
+    monkeypatch.setattr(main, "extract_pages_from_file", lambda file_bytes, filename: [])
+    monkeypatch.setattr(main.shutil, "which", lambda command: None)
+    upload = main.UploadFile(filename="scanned-notes.pdf", file=BytesIO(b"fake pdf bytes"))
+    try:
+        main.ingest_document(file=upload, user_id=42, document_id=None)
+    except HTTPException as exc:
+        # Current endpoint responds with an explicit failure result; the Java upload
+        # layer must reject success=false / zero chunks instead of marking it searchable.
+        assert exc.status_code == 422
+    except Exception as exc:
+        # The implementation may return an explicit success=False response while
+        # retaining HTTP 200 for backwards compatibility; it must never claim success.
+        assert isinstance(exc, AssertionError)
+    else:
+        raise AssertionError("Unreadable scanned PDF must not be indexed or claimed as successful.")
