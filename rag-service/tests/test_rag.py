@@ -34,6 +34,9 @@ def test_self_reference_uses_word_boundaries():
     assert main.is_self_referential_query("Mera CGPA kya hai?", profile)
     assert main.is_self_referential_query("What is Md Kaif Ali's role?", profile)
     assert not main.is_self_referential_query("Explain semester 6 syllabus", profile)
+    assert not main.is_self_referential_query("Tell me about Spring Boot", profile)
+    assert not main.is_self_referential_query("Explain the main method in Java", profile)
+    assert main.is_self_referential_query("Main kaun hu?", profile)
 
 
 def test_scope_filter_denies_unauthenticated_user():
