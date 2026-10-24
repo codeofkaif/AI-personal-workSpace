@@ -45,7 +45,7 @@ def test_scope_filter_denies_unauthenticated_user():
 def test_personal_scope_is_parameterized():
     clause, params = main._scope_filter(42, "Personal Only")
     assert "d.user_id" in clause
-    assert params == (42,)
+    assert params == (42, 42)
 
 
 def test_college_scope_checks_current_users_college():
@@ -74,3 +74,40 @@ def test_valid_citation_is_preserved():
     context = [{"filename": "syllabus.pdf", "content": "The exam is in December."}]
     answer = "The exam is in December. [Source: syllabus.pdf]"
     assert main._validate_source_citations(answer, context) == answer
+
+
+class FakeVectorBatch(list):
+    def tolist(self):
+        return list(self)
+
+
+class FakeE5Model:
+    def __init__(self):
+        self.inputs = None
+        self.tokenizer = WhitespaceTokenizer()
+
+    def encode(self, texts, **kwargs):
+        self.inputs = texts
+        return FakeVectorBatch([[1.0] + [0.0] * (main.EMBEDDING_DIMENSION - 1) for _ in texts])
+
+
+def test_e5_uses_query_and_passage_prefixes(monkeypatch):
+    fake = FakeE5Model()
+    monkeypatch.setattr(main, "get_model", lambda: fake)
+    passages = main.get_embeddings(["document text"])
+    queries = main.get_embeddings(["question text"], is_query=True)
+    assert fake.inputs == ["query: question text"]
+    assert len(passages[0]) == main.EMBEDDING_DIMENSION
+    assert len(queries[0]) == main.EMBEDDING_DIMENSION
+
+
+def test_embedding_failure_is_not_converted_to_zero_vector(monkeypatch):
+    def fail_model():
+        raise RuntimeError("model weights missing")
+    monkeypatch.setattr(main, "get_model", fail_model)
+    try:
+        main.get_embedding("a question", is_query=True)
+    except RuntimeError as exc:
+        assert "model weights missing" in str(exc)
+    else:
+        raise AssertionError("Embedding failure must propagate; zero vectors are unsafe.")
