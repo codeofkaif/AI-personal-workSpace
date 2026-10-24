@@ -308,6 +308,47 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
         chunks.append("\n\n".join(current))
     return [chunk for chunk in chunks if chunk.strip()]
 
+def ensure_chunk_schema(conn) -> None:
+    """Create/update chunk schema and label legacy vectors with their original model."""
+    cur = conn.cursor()
+    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            id SERIAL PRIMARY KEY,
+            content TEXT,
+            metadata JSONB,
+            page_number INTEGER DEFAULT 0,
+            chunk_index INTEGER DEFAULT 0,
+            document_id INTEGER,
+            embedding vector(384),
+            embedding_model TEXT
+        )
+    """)
+    cur.execute("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding_model TEXT")
+    cur.execute(
+        "UPDATE document_chunks SET embedding_model = %s WHERE embedding_model IS NULL",
+        (LEGACY_EMBEDDING_MODEL_NAME,)
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_document_id ON document_chunks (document_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_fts ON document_chunks USING GIN (to_tsvector('simple', COALESCE(content, '')))")
+    conn.commit()
+    cur.close()
+
+@app.on_event("startup")
+def initialize_rag_storage():
+    conn = get_db_connection()
+    if conn is None:
+        logger.warning("Database unavailable during startup; schema will be initialized during ingestion.")
+        return
+    try:
+        ensure_chunk_schema(conn)
+        logger.info("RAG chunk schema initialized")
+    except Exception:
+        conn.rollback()
+        logger.exception("Could not initialize RAG chunk schema")
+    finally:
+        conn.close()
+
 def _metadata_dict(metadata: Any) -> Dict[str, Any]:
     if isinstance(metadata, dict):
         return metadata
@@ -380,11 +421,11 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
                    dc.document_id, dc.chunk_index, dc.page_number
             FROM document_chunks dc
             LEFT JOIN documents d ON dc.document_id = d.id
-            WHERE {where_sql} AND dc.embedding IS NOT NULL
+            WHERE {where_sql} AND dc.embedding IS NOT NULL AND dc.embedding_model = %s
             ORDER BY dc.embedding <=> %s::vector
             LIMIT %s
         """
-        cur.execute(dense_sql, (question_embedding, *scope_params, question_embedding, candidate_k))
+        cur.execute(dense_sql, (question_embedding, *scope_params, EMBEDDING_MODEL_NAME, question_embedding, candidate_k))
         for rank, row in enumerate(cur.fetchall(), start=1):
             chunk_id, content, metadata, similarity, doc_id, chunk_index, page_number = row
             fused[chunk_id] = {
@@ -402,11 +443,12 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
             FROM document_chunks dc
             LEFT JOIN documents d ON dc.document_id = d.id
             WHERE {where_sql}
+              AND dc.embedding_model = %s
               AND to_tsvector('simple', COALESCE(dc.content, '')) @@ plainto_tsquery('simple', %s)
             ORDER BY lexical_score DESC
             LIMIT %s
         """
-        cur.execute(keyword_sql, (question_embedding, question, *scope_params, question, candidate_k))
+        cur.execute(keyword_sql, (question_embedding, question, *scope_params, EMBEDDING_MODEL_NAME, question, candidate_k))
         for rank, row in enumerate(cur.fetchall(), start=1):
             chunk_id, content, metadata, similarity, doc_id, chunk_index, page_number, lexical_score = row
             if chunk_id in fused:
