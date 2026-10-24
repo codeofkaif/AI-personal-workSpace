@@ -19,13 +19,13 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="AI Personal Workspace — RAG Service",
     description="FastAPI service for document ingestion, embeddings, and role-aware AI Q&A",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[x.strip() for x in os.getenv("RAG_CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(",") if x.strip()],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -52,28 +52,43 @@ class IngestResponse(BaseModel):
 
 # ── Global SentenceTransformer Model ─────────────────────────────────────────
 
+# Model and vector-column dimensions must match. A model change requires re-embedding all chunks.
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
+CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "350"))
+CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
+OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.85"))
+RAG_CANDIDATE_K = int(os.getenv("RAG_CANDIDATE_K", "20"))
+RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.25"))
+
 _embedding_model = None
 
 def get_model():
     global _embedding_model
     if _embedding_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("SentenceTransformer 'all-MiniLM-L6-v2' initialized successfully")
-        except Exception as e:
-            logger.warning(f"Failed to initialize SentenceTransformer: {e}")
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        dimension = _embedding_model.get_sentence_embedding_dimension()
+        if dimension != EMBEDDING_DIMENSION:
+            _embedding_model = None
+            raise RuntimeError(
+                f"Embedding dimension mismatch: model={dimension}, configured={EMBEDDING_DIMENSION}. "
+                "Migrate/re-embed all existing chunks before changing embedding models."
+            )
+        logger.info("Embedding model %s ready (dimension=%s)", EMBEDDING_MODEL_NAME, dimension)
     return _embedding_model
 
 def get_embedding(text: str) -> List[float]:
-    """Generate 384-dimensional embedding"""
-    model = get_model()
-    if model is not None:
-        try:
-            return model.encode(text).tolist()
-        except Exception as e:
-            logger.warning(f"Embedding encoding error: {e}")
-    return [0.0] * 384
+    """Return a normalized embedding or fail; never index/search with a fake zero vector."""
+    if not text or not text.strip():
+        raise ValueError("Cannot embed empty text")
+    values = get_model().encode(text, normalize_embeddings=True, convert_to_numpy=True).tolist()
+    if len(values) != EMBEDDING_DIMENSION:
+        raise RuntimeError("Embedding dimension mismatch")
+    return values
 
 # ── DB Connection ─────────────────────────────────────────────────────────────
 
@@ -228,21 +243,62 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
         logger.error(f"Text extraction error: {e}")
         return ""
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
-    """Split text into overlapping word chunks"""
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), max(1, chunk_size - overlap)):
-        chunk = " ".join(words[i:i + chunk_size])
-        if chunk.strip():
-            chunks.append(chunk)
-    return chunks
+def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[int] = None) -> List[str]:
+    """Paragraph-aware chunks bounded with the embedding tokenizer when available."""
+    target = max(64, chunk_size or CHUNK_SIZE_TOKENS)
+    overlap_tokens = max(0, min(overlap if overlap is not None else CHUNK_OVERLAP_TOKENS, target // 3))
+    tokenizer = getattr(get_model(), "tokenizer", None)
+
+    def size_of(value: str) -> int:
+        if tokenizer:
+            try:
+                return len(tokenizer.encode(value, add_special_tokens=False))
+            except Exception:
+                pass
+        return len(value.split())
+
+    def split_large(value: str) -> List[str]:
+        if size_of(value) <= target:
+            return [value]
+        if tokenizer:
+            ids = tokenizer.encode(value, add_special_tokens=False)
+            pieces = []
+            step = max(1, target - overlap_tokens)
+            for i in range(0, len(ids), step):
+                piece = tokenizer.decode(ids[i:i + target], skip_special_tokens=True).strip()
+                if piece:
+                    pieces.append(piece)
+            return pieces
+        words = value.split()
+        step = max(1, target - overlap_tokens)
+        return [" ".join(words[i:i + target]) for i in range(0, len(words), step)]
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    units = [piece for part in paragraphs for piece in split_large(part)]
+    chunks, current, current_size = [], [], 0
+    for unit in units:
+        unit_size = size_of(unit)
+        if current and current_size + unit_size > target:
+            chunks.append("\n\n".join(current))
+            tail, tail_size = [], 0
+            for prior in reversed(current):
+                prior_size = size_of(prior)
+                if tail_size + prior_size > overlap_tokens:
+                    break
+                tail.insert(0, prior)
+                tail_size += prior_size
+            current, current_size = tail, tail_size
+        current.append(unit)
+        current_size += unit_size
+    if current:
+        chunks.append("\n\n".join(current))
+    return [chunk for chunk in chunks if chunk.strip()]
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "service": "RAG Service", "version": "1.1.0"}
+    return {"status": "healthy", "service": "RAG Service", "version": "1.2.0", "embedding_model": EMBEDDING_MODEL_NAME, "embedding_dimension": EMBEDDING_DIMENSION}
 
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest_document(
@@ -376,7 +432,11 @@ async def query_ai(req: QueryRequest):
         sources = []
 
         # 1. Embed question
-        question_embedding = get_embedding(req.question)
+        try:
+            question_embedding = get_embedding(req.question)
+        except Exception as e:
+            logger.exception("Query embedding failed")
+            raise HTTPException(status_code=503, detail="Embedding model unavailable or misconfigured.") from e
 
         # 2. Search pgvector with STRICT USER PERMISSION ENFORCEMENT & Hybrid Keyword Search
         conn = get_db_connection()
@@ -518,10 +578,12 @@ def _call_ollama(prompt: str, max_tokens: int = 500) -> Optional[str]:
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": False,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
                 "options": {
+                    "num_ctx": OLLAMA_NUM_CTX,
                     "num_predict": max_tokens,
-                    "temperature": 0.15,
-                    "top_p": 0.85
+                    "temperature": OLLAMA_TEMPERATURE,
+                    "top_p": OLLAMA_TOP_P
                 }
             },
             timeout=50,
