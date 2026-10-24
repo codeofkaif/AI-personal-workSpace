@@ -7,7 +7,7 @@ Trained for User Identity & Role Awareness ("me" / "mera" = authenticated user p
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import os
 import json
@@ -35,11 +35,11 @@ app.add_middleware(
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
-    question: str
-    user_id: Optional[int] = None
-    top_k: Optional[int] = 5
+    question: str = Field(min_length=1, max_length=4000)
+    user_id: Optional[int] = Field(default=None, gt=0)
+    top_k: int = Field(default=5, ge=1, le=8)
     user_profile: Optional[Dict[str, Any]] = None
-    scope: Optional[str] = "College + Personal"
+    scope: str = Field(default="College + Personal", pattern="^(Personal Only|College Only|College \\+ Personal)$")
 
 class QueryResponse(BaseModel):
     answer: str
@@ -71,6 +71,8 @@ RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.10"))
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() in {"1", "true", "yes"}
 RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 RAG_CANDIDATE_K = min(50, max(1, RAG_CANDIDATE_K))
+OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "350"))))
+OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")))
 
 _embedding_model = None
 
@@ -198,27 +200,27 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
     return profile
 
 def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
-    """Detect if the user is asking about themselves, their profile, or their role"""
+    """Detect self-reference without substring matches such as me inside semester."""
     q_lower = q.lower()
     name = (profile.get("name") or "").lower()
     first_name = name.split()[0] if name else ""
 
-    triggers = [
-        "me", "mera", "meri", "mere", "mai", "main", "my", "mine", "myself",
-        "who am i", "who i am", "apne", "apna", "apni", "profile", "role",
-        "placement", "cgpa", "department", "roll number", "attendance",
-        "kaun hu", "kya hu", "about me", "my resume", "mera resume",
-        "meri placement", "mera score", "mere bare", "mere baare",
-        "scholarship", "chhatravritti", "chhatravriti", "fee", "fees"
-    ]
-
-    if name and name in q_lower:
+    self_words = {"me", "mera", "meri", "mere", "mai", "main", "my", "mine", "myself", "apne", "apna", "apni"}
+    self_phrases = (
+        "who am i", "who i am", "about me", "my profile", "mera profile", "meri profile",
+        "my role", "mera role", "meri role", "my resume", "mera resume", "meri resume",
+        "my placement", "mera placement", "meri placement", "my score", "mera score",
+        "mere bare", "mere baare", "mere baare mein", "my cgpa", "mera cgpa",
+        "my scholarship", "meri scholarship", "my fees", "meri fees"
+    )
+    if name and re.search(r"\\b" + re.escape(name) + r"\\b", q_lower):
         return True
-    if first_name and len(first_name) > 2 and first_name in q_lower:
+    if first_name and len(first_name) > 2 and re.search(r"\\b" + re.escape(first_name) + r"\\b", q_lower):
         return True
-
-    words = set(re.findall(r'\b\w+\b', q_lower))
-    return any(t in words or t in q_lower for t in triggers)
+    if any(phrase in q_lower for phrase in self_phrases):
+        return True
+    words = set(re.findall(r"\\b\\w+\\b", q_lower))
+    return bool(words & self_words)
 
 def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     """Extract text content from uploaded file, stripping null bytes for PostgreSQL compatibility"""
@@ -675,14 +677,16 @@ async def query_ai(req: QueryRequest):
             sources=sources[:5],
             chunks_used=len(context_items)
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Query error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Query error")
+        raise HTTPException(status_code=500, detail="AI query failed due to an internal error.") from e
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "gemma2:2b")
 
-def _call_ollama(prompt: str, max_tokens: int = 500) -> Optional[str]:
+def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[str]:
     """Call local Ollama API with tuned generation parameters"""
     try:
         import httpx
@@ -700,7 +704,7 @@ def _call_ollama(prompt: str, max_tokens: int = 500) -> Optional[str]:
                     "top_p": OLLAMA_TOP_P
                 }
             },
-            timeout=50,
+            timeout=OLLAMA_TIMEOUT_SECONDS,
         )
         if resp.status_code == 200:
             return resp.json().get("response", "").strip()
@@ -805,7 +809,7 @@ USER QUESTION:
 
 STRUCTURED & FACTUAL RESPONSE:"""
 
-    ollama_answer = _call_ollama(prompt, max_tokens=500)
+    ollama_answer = _call_ollama(prompt, max_tokens=OLLAMA_NUM_PREDICT)
     if ollama_answer:
         cleaned = clean_and_format_answer(ollama_answer)
         logger.info(f"Ollama ({OLLAMA_MODEL}) generated high-precision RAG answer.")
