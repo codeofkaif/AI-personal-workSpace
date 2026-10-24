@@ -402,7 +402,13 @@ def _scope_filter(user_id: Optional[int], scope: str) -> tuple[str, tuple]:
     if not user_id:
         return "FALSE", ()
     personal = """(
-        COALESCE(d.user_id, NULLIF(dc.metadata->>'user_id', '')::bigint) = %s
+        (
+            (d.id IS NOT NULL AND d.user_id = %s)
+            OR (
+                dc.document_id IS NULL AND d.id IS NULL
+                AND NULLIF(dc.metadata->>'user_id', '')::bigint = %s
+            )
+        )
         AND COALESCE(d.is_college_doc, FALSE) IS NOT TRUE
     )"""
     college = """(
@@ -411,10 +417,10 @@ def _scope_filter(user_id: Optional[int], scope: str) -> tuple[str, tuple]:
         AND (SELECT u.college_id FROM users u WHERE u.id = %s) IS NOT NULL
     )"""
     if scope == "Personal Only":
-        return personal, (user_id,)
+        return personal, (user_id, user_id)
     if scope == "College Only":
         return college, (user_id, user_id)
-    return f"({personal} OR {college})", (user_id, user_id, user_id)
+    return f"({personal} OR {college})", (user_id, user_id, user_id, user_id)
 
 def retrieve_context(question: str, question_embedding: List[float], user_id: Optional[int],
                      scope: str, top_k: int) -> List[Dict[str, Any]]:
