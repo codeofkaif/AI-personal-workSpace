@@ -251,9 +251,9 @@ def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
         "main kaun hu", "mai kaun hu", "main kaun hoon", "mai kaun hoon",
         "main kya hu", "mai kya hu", "mera kya status", "meri kya status"
     )
-    if name and re.search(r"\\b" + re.escape(name) + r"\\b", q_lower):
+    if name and re.search(r"\b" + re.escape(name) + r"\b", q_lower):
         return True
-    if first_name and len(first_name) > 2 and re.search(r"\\b" + re.escape(first_name) + r"\\b", q_lower):
+    if first_name and len(first_name) > 2 and re.search(r"\b" + re.escape(first_name) + r"\b", q_lower):
         return True
     if any(phrase in q_lower for phrase in self_phrases):
         return True
