@@ -51,12 +51,13 @@ public class DocumentService {
         doc = documentRepository.save(doc);
 
         // 3. The upload is not complete until RAG confirms that searchable chunks exist.
-        int chunks = aiClientService.ingestDocument(file, user.getId(), doc.getId());
-        if (chunks <= 0) {
+        AIClientService.IngestionResult ingestion =
+            aiClientService.ingestDocumentResult(file, user.getId(), doc.getId());
+        if (!ingestion.indexed()) {
             rollbackFailedUpload(doc, filePath, user.getId());
-            throw indexingFailure(file.getOriginalFilename(), chunks);
+            throw indexingFailure(file.getOriginalFilename(), ingestion);
         }
-        log.info("RAG ingested {} chunks for doc id={}", chunks, doc.getId());
+        log.info("RAG ingested {} chunks for doc id={}", ingestion.chunksCreated(), doc.getId());
         return toResponse(doc);
     }
 
@@ -84,12 +85,13 @@ public class DocumentService {
         doc = documentRepository.save(doc);
 
         // 3. The upload is not complete until RAG confirms that searchable chunks exist.
-        int chunks = aiClientService.ingestDocument(file, admin.getId(), doc.getId());
-        if (chunks <= 0) {
+        AIClientService.IngestionResult ingestion =
+            aiClientService.ingestDocumentResult(file, admin.getId(), doc.getId());
+        if (!ingestion.indexed()) {
             rollbackFailedUpload(doc, filePath, admin.getId());
-            throw indexingFailure(file.getOriginalFilename(), chunks);
+            throw indexingFailure(file.getOriginalFilename(), ingestion);
         }
-        log.info("College doc ingested: {} chunks for doc id={}", chunks, doc.getId());
+        log.info("College doc ingested: {} chunks for doc id={}", ingestion.chunksCreated(), doc.getId());
         return toResponse(doc);
     }
 
@@ -147,18 +149,35 @@ public class DocumentService {
         }
     }
 
-    private ResponseStatusException indexingFailure(String filename, int chunks) {
-        if (chunks == 0) {
-            return new ResponseStatusException(
-                HttpStatus.UNPROCESSABLE_ENTITY,
-                "Upload rejected: no searchable text chunks were produced for '" + filename
-                    + "'. For scanned PDFs, install Tesseract OCR and verify its language packs, then upload again."
-            );
+    private ResponseStatusException indexingFailure(
+            String filename, AIClientService.IngestionResult ingestion) {
+        int upstreamStatus = ingestion.httpStatus();
+        HttpStatus responseStatus;
+        if (upstreamStatus == HttpStatus.UNPROCESSABLE_ENTITY.value()) {
+            responseStatus = HttpStatus.UNPROCESSABLE_ENTITY;
+        } else if (upstreamStatus == HttpStatus.PAYLOAD_TOO_LARGE.value()) {
+            responseStatus = HttpStatus.PAYLOAD_TOO_LARGE;
+        } else if (upstreamStatus == HttpStatus.UNSUPPORTED_MEDIA_TYPE.value()) {
+            responseStatus = HttpStatus.UNSUPPORTED_MEDIA_TYPE;
+        } else if (upstreamStatus == HttpStatus.TOO_MANY_REQUESTS.value()) {
+            responseStatus = HttpStatus.TOO_MANY_REQUESTS;
+        } else {
+            // 401/403 are service-to-service auth failures, not end-user auth failures.
+            responseStatus = HttpStatus.SERVICE_UNAVAILABLE;
+        }
+
+        String details = ingestion.message();
+        if (details == null || details.isBlank()) {
+            details = responseStatus == HttpStatus.UNPROCESSABLE_ENTITY
+                ? "No searchable text chunks were produced. Scanned PDFs may require Tesseract OCR."
+                : "RAG did not confirm indexing. Check RAG health and ensure RAG_API_KEY matches in both services.";
+        } else if (upstreamStatus == HttpStatus.UNAUTHORIZED.value()
+                || upstreamStatus == HttpStatus.FORBIDDEN.value()) {
+            details += " This is a backend-to-RAG authentication failure; check that RAG_API_KEY matches in both services.";
         }
         return new ResponseStatusException(
-            HttpStatus.SERVICE_UNAVAILABLE,
-            "Upload failed: the RAG service did not confirm document indexing for '" + filename
-                + "'. Check RAG health, the shared RAG_API_KEY, and service logs, then retry."
+            responseStatus,
+            "Document '" + filename + "' was not indexed: " + details
         );
     }
 
