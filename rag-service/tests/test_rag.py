@@ -2,6 +2,7 @@ from pathlib import Path
 from io import BytesIO
 import sys
 from types import SimpleNamespace
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import main
@@ -156,18 +157,174 @@ def test_ollama_health_requires_exact_configured_model_tag():
 
 def test_scan_pdf_without_extractable_text_is_never_reported_as_indexed(monkeypatch):
     from fastapi import HTTPException
+
     monkeypatch.setattr(main, "extract_pages_from_file", lambda file_bytes, filename: [])
     monkeypatch.setattr(main.shutil, "which", lambda command: None)
     upload = main.UploadFile(filename="scanned-notes.pdf", file=BytesIO(b"fake pdf bytes"))
-    try:
+
+    with pytest.raises(HTTPException) as raised:
         main.ingest_document(file=upload, user_id=42, document_id=None)
-    except HTTPException as exc:
-        # Current endpoint responds with an explicit failure result; the Java upload
-        # layer must reject success=false / zero chunks instead of marking it searchable.
-        assert exc.status_code == 422
-    except Exception as exc:
-        # The implementation may return an explicit success=False response while
-        # retaining HTTP 200 for backwards compatibility; it must never claim success.
-        assert isinstance(exc, AssertionError)
-    else:
-        raise AssertionError("Unreadable scanned PDF must not be indexed or claimed as successful.")
+
+    assert raised.value.status_code == 422
+    assert "not indexed" in raised.value.detail
+    assert "Tesseract" in raised.value.detail
+
+
+class FakeRagCursor:
+    def __init__(self, database):
+        self.database = database
+        self.rows = []
+        self.one = None
+
+    def execute(self, query, params=None):
+        normalized = " ".join(query.split())
+        params = params or ()
+        self.rows = []
+        self.one = None
+
+        if normalized.startswith("INSERT INTO document_chunks"):
+            content, metadata, page_number, chunk_index, document_id, embedding, embedding_model = params
+            import json
+            decoded_metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+            row = {
+                "id": self.database.next_id,
+                "content": content,
+                "metadata": decoded_metadata,
+                "page_number": page_number,
+                "chunk_index": chunk_index,
+                "document_id": document_id,
+                "embedding": embedding,
+                "embedding_model": embedding_model,
+            }
+            self.database.rows.append(row)
+            self.database.next_id += 1
+        elif normalized.startswith("DELETE FROM document_chunks"):
+            if "metadata->>'user_id'" in normalized:
+                owner, filename = params
+                self.database.rows = [
+                    row for row in self.database.rows
+                    if not (
+                        row["document_id"] is None
+                        and str(row["metadata"].get("user_id")) == str(owner)
+                        and row["metadata"].get("filename") == filename
+                    )
+                ]
+            elif params:
+                doc_id = params[0]
+                self.database.rows = [row for row in self.database.rows if row["document_id"] != doc_id]
+        elif normalized.startswith("SELECT dc.id") and "ORDER BY dc.embedding <=> " in normalized:
+            # Simulate the committed database rows returned by the dense pgvector query.
+            requested_user = params[1] if len(params) > 1 else None
+            model_name = params[-3] if len(params) >= 3 else None
+            for row in self.database.rows:
+                if row["embedding_model"] != model_name:
+                    continue
+                if str(row["metadata"].get("user_id")) != str(requested_user):
+                    continue
+                self.rows.append((
+                    row["id"], row["content"], row["metadata"], 0.93,
+                    row["document_id"], row["chunk_index"], row["page_number"]
+                ))
+        elif normalized.startswith("SELECT 1"):
+            self.one = (1,)
+        elif "SELECT user_id, is_college_doc FROM documents" in normalized:
+            self.one = None
+
+    def fetchall(self):
+        return list(self.rows)
+
+    def fetchone(self):
+        return self.one
+
+    def close(self):
+        pass
+
+
+class FakeRagDatabase:
+    def __init__(self):
+        self.rows = []
+        self.next_id = 1
+        self.commits = 0
+
+    def cursor(self):
+        return FakeRagCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_new_document_is_immediately_retrievable_from_database(monkeypatch):
+    """Regression: POST /ingest must commit chunks before the immediate POST /query."""
+    from fastapi.testclient import TestClient
+
+    marker = "ORBITAL-ATLAS-7391"
+    db = FakeRagDatabase()
+    seen_context = {}
+
+    monkeypatch.setattr(main, "get_db_connection", lambda: db)
+    monkeypatch.setattr(
+        main, "extract_pages_from_file",
+        lambda file_bytes, filename: [(1, f"Private test marker: {marker}.")]
+    )
+    monkeypatch.setattr(main, "chunk_text", lambda text: [text])
+    monkeypatch.setattr(
+        main, "get_embeddings",
+        lambda texts, is_query=False: [[0.0] * main.EMBEDDING_DIMENSION for _ in texts]
+    )
+    monkeypatch.setattr(
+        main, "get_embedding",
+        lambda text, is_query=False: [0.0] * main.EMBEDDING_DIMENSION
+    )
+    monkeypatch.setattr(
+        main, "get_model",
+        lambda: SimpleNamespace(tokenizer=WhitespaceTokenizer())
+    )
+    monkeypatch.setattr(
+        main, "fetch_user_profile",
+        lambda user_id, passed_profile=None: {
+            "id": user_id, "name": "Test User", "role": "STUDENT",
+            "college": "Test College", "department": "CSE"
+        }
+    )
+
+    def fake_generate(question, context_items, user_profile, is_self):
+        seen_context["items"] = list(context_items)
+        return f"The indexed marker is {marker}. [Source: fresh.txt]"
+
+    monkeypatch.setattr(main, "generate_answer", fake_generate)
+    headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
+
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/ingest",
+            files={"file": ("fresh.txt", b"Private test marker: ORBITAL-ATLAS-7391.", "text/plain")},
+            data={"user_id": "42"},
+            headers=headers,
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        upload_json = uploaded.json()
+        assert upload_json["success"] is True
+        assert upload_json["chunks_created"] == 1
+        assert db.commits >= 2
+        assert len(db.rows) == 1
+        assert db.rows[0]["content"] == f"Private test marker: {marker}."
+
+        # No delay: this query runs immediately after the upload response commits.
+        result = client.post(
+            "/query",
+            json={"question": "What is the private test marker?", "user_id": 42,
+                  "scope": "Personal Only", "top_k": 5},
+            headers=headers,
+        )
+        assert result.status_code == 200, result.text
+        query_json = result.json()
+        assert query_json["chunks_used"] == 1
+        assert marker in query_json["answer"]
+        assert query_json["sources"] == ["fresh.txt"]
+        assert seen_context["items"][0]["content"] == f"Private test marker: {marker}."
