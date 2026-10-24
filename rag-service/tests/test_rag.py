@@ -363,7 +363,8 @@ def test_ambiguous_query_returns_followup_before_retrieval(monkeypatch):
     assert payload["answer"]
 
 
-def test_pending_clarification_uses_original_question():
+def test_pending_clarification_uses_original_question(monkeypatch):
+    monkeypatch.setattr(main, "_classify_query_clarity", lambda question, history: None)
     history = [
         main.ConversationTurn(role="user", content="Explain Spring"),
         main.ConversationTurn(
@@ -413,3 +414,26 @@ def test_clear_long_query_passes_through_if_classifier_is_unavailable(monkeypatc
     result = main.understand_query("Explain how PostgreSQL full text search complements vector retrieval in RAG", [])
     assert result["action"] == "answer"
     assert "PostgreSQL" in result["normalized_query"]
+
+
+
+def test_vague_confirmation_does_not_silently_resolve_two_option_clarification(monkeypatch):
+    monkeypatch.setattr(
+        main, "_classify_query_clarity",
+        lambda question, history: {
+            "action": "clarify",
+            "normalized_query": None,
+            "clarification_question": "Please choose Spring Framework or the spring season.",
+        },
+    )
+    history = [
+        main.ConversationTurn(role="user", content="Explain Spring"),
+        main.ConversationTurn(
+            role="assistant",
+            content="Do you mean Spring Framework or the season?",
+            clarification_needed=True,
+        ),
+    ]
+    result = main.understand_query("yes", history)
+    assert result["action"] == "clarify"
+    assert "choose" in result["clarification_question"]
