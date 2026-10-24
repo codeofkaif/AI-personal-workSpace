@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import hmac
+import shutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -233,6 +234,28 @@ def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
     words = set(re.findall(r"\b\w+\b", q_lower))
     return bool(words & self_words)
 
+def _ocr_pdf_page(file_bytes: bytes, page_index: int) -> str:
+    """Optional local OCR fallback. Requires PyMuPDF and the system Tesseract binary."""
+    if os.getenv("OCR_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        return ""
+    if not shutil.which("tesseract"):
+        logger.warning("OCR is enabled but Tesseract is not installed; scanned PDF pages remain unreadable.")
+        return ""
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+        with fitz.open(stream=file_bytes, filetype="pdf") as document:
+            page = document.load_page(page_index)
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+            return (pytesseract.image_to_string(
+                image, lang=os.getenv("OCR_LANG", "eng"), config="--psm 3"
+            ) or "").strip()
+    except Exception:
+        logger.exception("OCR failed on PDF page %s", page_index + 1)
+        return ""
+
 def extract_pages_from_file(file_bytes: bytes, filename: str) -> List[tuple[int, str]]:
     """Extract text with PDF page provenance; non-paginated formats use page 0."""
     lower_name = (filename or "").lower()
@@ -245,10 +268,13 @@ def extract_pages_from_file(file_bytes: bytes, filename: str) -> List[tuple[int,
             except Exception:
                 import PyPDF2
                 reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-            return [
-                (index + 1, (page.extract_text() or "").replace("\x00", "").strip())
-                for index, page in enumerate(reader.pages)
-            ]
+            extracted = []
+            for index, page in enumerate(reader.pages):
+                text = (page.extract_text() or "").replace("\x00", "").strip()
+                if not text:
+                    text = _ocr_pdf_page(file_bytes, index)
+                extracted.append((index + 1, text))
+            return extracted
         if lower_name.endswith(".docx"):
             import io
             import docx
