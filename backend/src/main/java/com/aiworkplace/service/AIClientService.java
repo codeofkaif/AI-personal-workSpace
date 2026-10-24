@@ -147,6 +147,32 @@ public class AIClientService {
         return -1;
     }
 
+    /**
+     * Remove vectors for an owned document before deleting its relational record.
+     * The RAG service verifies ownership independently; the shared service key never reaches the browser.
+     */
+    public boolean deleteDocumentChunks(Long documentId, Long userId) {
+        if (documentId == null || userId == null) {
+            return false;
+        }
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            if (ragApiKey != null && !ragApiKey.isBlank()) {
+                headers.set("X-RAG-API-Key", ragApiKey);
+            }
+            HttpEntity<Void> request = new HttpEntity<>(headers);
+            String url = ragBaseUrl + "/documents/" + documentId + "?user_id=" + userId;
+            ResponseEntity<Map> response = restTemplate.exchange(
+                url, HttpMethod.DELETE, request, Map.class);
+            return response.getStatusCode().is2xxSuccessful()
+                && response.getBody() != null
+                && Boolean.TRUE.equals(response.getBody().get("success"));
+        } catch (Exception e) {
+            log.warn("Could not purge RAG chunks for document {} (user {}): {}", documentId, userId, e.getMessage());
+            return false;
+        }
+    }
+
     /** Check if FastAPI RAG service is reachable */
     public String getStatus() {
         try {
