@@ -213,9 +213,9 @@ def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
         "mere bare", "mere baare", "mere baare mein", "my cgpa", "mera cgpa",
         "my scholarship", "meri scholarship", "my fees", "meri fees"
     )
-    if name and re.search(r"\b" + re.escape(name) + r"\\b", q_lower):
+    if name and re.search(r"\b" + re.escape(name) + r"\b", q_lower):
         return True
-    if first_name and len(first_name) > 2 and re.search(r"\\b" + re.escape(first_name) + r"\\b", q_lower):
+    if first_name and len(first_name) > 2 and re.search(r"\b" + re.escape(first_name) + r"\b", q_lower):
         return True
     if any(phrase in q_lower for phrase in self_phrases):
         return True
