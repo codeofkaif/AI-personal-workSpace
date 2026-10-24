@@ -501,74 +501,90 @@ async def ingest_document(
     user_id: Optional[int] = Form(None),
     document_id: Optional[int] = Form(None)
 ):
-    """Ingest a document: extract text → chunk → embed → store in pgvector"""
+    """Extract, chunk, batch-embed, then atomically replace the document's indexed chunks."""
+    conn = None
     try:
+        if user_id is None:
+            raise HTTPException(status_code=400, detail="user_id is required for isolated document ingestion.")
+        filename = (file.filename or "").strip()
+        if not filename:
+            raise HTTPException(status_code=400, detail="A filename is required.")
+        suffix = os.path.splitext(filename)[1].lower()
+        if suffix not in {".pdf", ".docx", ".txt", ".md"}:
+            raise HTTPException(status_code=415, detail="Supported file types are PDF, DOCX, TXT, and MD.")
         file_bytes = await file.read()
-        logger.info(f"Ingesting: {file.filename} (size: {len(file_bytes)} bytes) for user: {user_id}")
-        
-        text = extract_text_from_file(file_bytes, file.filename)
+        max_upload_bytes = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+        if len(file_bytes) > max_upload_bytes:
+            raise HTTPException(status_code=413, detail="Uploaded file exceeds the configured size limit.")
+        logger.info("Ingesting %s (%s bytes) for user %s", filename, len(file_bytes), user_id)
+
+        text = extract_text_from_file(file_bytes, filename)
         if not text.strip():
             return IngestResponse(
                 success=False,
-                message=f"Could not extract readable text from '{file.filename}'.",
+                message=f"No readable text could be extracted from '{filename}'. Scanned PDFs may require OCR.",
                 chunks_created=0
             )
-        
         chunks = chunk_text(text)
-        logger.info(f"Generated {len(chunks)} chunks from {file.filename}")
-        
+        if not chunks:
+            return IngestResponse(success=False, message="No non-empty chunks were produced.", chunks_created=0)
+
+        clean_chunks = [chunk.replace("\x00", "").strip() for chunk in chunks]
+        embeddings = get_embeddings(clean_chunks)
         conn = get_db_connection()
-        chunks_stored = 0
-        if conn:
-            try:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    CREATE EXTENSION IF NOT EXISTS vector;
-                    CREATE TABLE IF NOT EXISTS document_chunks (
-                        id SERIAL PRIMARY KEY,
-                        content TEXT,
-                        metadata JSONB,
-                        page_number INTEGER DEFAULT 0,
-                        chunk_index INTEGER DEFAULT 0,
-                        document_id INTEGER,
-                        embedding vector(384)
-                    );
-                """)
-                
-                meta_json = json.dumps({
-                    "filename": file.filename,
-                    "user_id": user_id,
-                    "document_id": document_id
-                })
-                
-                for i, chunk in enumerate(chunks):
-                    chunk_clean = chunk.replace('\x00', '')
-                    embedding = get_embedding(chunk_clean)
-                    cursor.execute(
-                        "INSERT INTO document_chunks (content, metadata, chunk_index, document_id, embedding) VALUES (%s, %s, %s, %s, %s)",
-                        (chunk_clean, meta_json, i, document_id, embedding)
-                    )
-                    chunks_stored += 1
-                
-                conn.commit()
-                cursor.close()
-                conn.close()
-                logger.info(f"Stored {chunks_stored} chunks in pgvector for {file.filename}")
-            except Exception as e:
-                logger.error(f"Database insertion failed: {e}")
-                if conn:
-                    conn.rollback()
-                    conn.close()
-        
+        if conn is None:
+            raise HTTPException(status_code=503, detail="Database unavailable; document was not indexed.")
+        ensure_chunk_schema(conn)
+        cursor = conn.cursor()
+
+        # Delete-and-reinsert runs in one transaction, preserving old chunks if any insert fails.
+        if document_id is not None:
+            cursor.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
+        else:
+            cursor.execute(
+                """DELETE FROM document_chunks
+                   WHERE document_id IS NULL AND metadata->>'user_id' = %s
+                     AND metadata->>'filename' = %s""",
+                (str(user_id), filename)
+            )
+
+        metadata = json.dumps({
+            "filename": filename,
+            "user_id": user_id,
+            "document_id": document_id,
+            "embedding_model": EMBEDDING_MODEL_NAME,
+            "chunking_version": "paragraph-token-v2",
+            "chunk_size_tokens": CHUNK_SIZE_TOKENS,
+            "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS
+        })
+        for index, (chunk, embedding) in enumerate(zip(clean_chunks, embeddings)):
+            cursor.execute(
+                """INSERT INTO document_chunks
+                   (content, metadata, chunk_index, document_id, embedding, embedding_model)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (chunk, metadata, index, document_id, embedding, EMBEDDING_MODEL_NAME)
+            )
+        conn.commit()
+        cursor.close()
+        logger.info("Indexed %s chunks for %s using %s", len(clean_chunks), filename, EMBEDDING_MODEL_NAME)
         return IngestResponse(
             success=True,
-            message=f"Document '{file.filename}' processed successfully ({chunks_stored} chunks indexed)",
-            document_id=str(document_id) if document_id else None,
-            chunks_created=chunks_stored or len(chunks)
+            message=f"Document '{filename}' processed and indexed successfully ({len(clean_chunks)} chunks).",
+            document_id=str(document_id) if document_id is not None else None,
+            chunks_created=len(clean_chunks)
         )
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
     except Exception as e:
-        logger.error(f"Ingest error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        if conn:
+            conn.rollback()
+        logger.exception("Document ingestion failed")
+        raise HTTPException(status_code=500, detail="Document ingestion failed; the index transaction was rolled back.") from e
+    finally:
+        if conn:
+            conn.close()
 
 @app.post("/query", response_model=QueryResponse)
 async def query_ai(req: QueryRequest):
