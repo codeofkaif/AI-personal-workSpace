@@ -25,6 +25,9 @@ public class AIClientService {
     @Value("${app.rag.base-url}")
     private String ragBaseUrl;
 
+    @Value("${app.rag.api-key:}")
+    private String ragApiKey;
+
     private final RestTemplate restTemplate;
 
     /** Send question to RAG /query endpoint with full user identity profile */
@@ -44,15 +47,26 @@ public class AIClientService {
                 profile.put("name", user.getName());
                 profile.put("email", user.getEmail());
                 profile.put("role", user.getRole().name());
-                profile.put("department", user.getDepartment() != null ? user.getDepartment() : "Computer Science & Engineering");
-                profile.put("roll_number", user.getRollNumber() != null ? user.getRollNumber() : "CS2026-" + user.getId());
-                profile.put("cgpa", user.getCgpa() != null ? user.getCgpa() : 8.5);
-                profile.put("college", user.getCollege() != null ? user.getCollege().getName() : "Babu Banarasi Das University");
+                if (user.getDepartment() != null && !user.getDepartment().isBlank()) {
+                    profile.put("department", user.getDepartment());
+                }
+                if (user.getRollNumber() != null && !user.getRollNumber().isBlank()) {
+                    profile.put("roll_number", user.getRollNumber());
+                }
+                if (user.getCgpa() != null) {
+                    profile.put("cgpa", user.getCgpa());
+                }
+                if (user.getCollege() != null && user.getCollege().getName() != null) {
+                    profile.put("college", user.getCollege().getName());
+                }
                 body.put("user_profile", profile);
             }
 
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
+            if (ragApiKey != null && !ragApiKey.isBlank()) {
+                headers.set("X-RAG-API-Key", ragApiKey);
+            }
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
 
             ResponseEntity<Map> response = restTemplate.postForEntity(
@@ -92,6 +106,9 @@ public class AIClientService {
 
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+            if (ragApiKey != null && !ragApiKey.isBlank()) {
+                headers.set("X-RAG-API-Key", ragApiKey);
+            }
 
             MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
 
