@@ -103,6 +103,7 @@ OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() in {"1", "true", 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b-q4_K_M")
 OLLAMA_THINK = os.getenv("OLLAMA_THINK", "true").strip().lower() in {"1", "true", "yes", "on"}
+RAG_QUERY_CLARIFICATION_ENABLED = os.getenv("RAG_QUERY_CLARIFICATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 _QUERY_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_QUERIES)
 _INGEST_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_INGESTIONS)
 
@@ -773,9 +774,14 @@ def understand_query(
     if fallback:
         return {"action": "clarify", "normalized_query": None, "clarification_question": fallback}
 
-    if not _needs_clarity_preflight(question, history):
+    if not RAG_QUERY_CLARIFICATION_ENABLED:
+        # Deterministic obvious-ambiguity handling remains active even when the model
+        # classifier is disabled through configuration.
         return {"action": "answer", "normalized_query": question.strip(), "clarification_question": None}
 
+    # The optional model preflight runs on ordinary queries too, so it can normalize
+    # misspellings and catch garbled longer inputs that simple length heuristics miss.
+    # Greetings and obviously incomplete standalone inputs were handled above.
     classified = _classify_query_clarity(question, history)
     if classified:
         return classified
