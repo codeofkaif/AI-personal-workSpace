@@ -253,6 +253,13 @@ The embedding model and chunking strategy changed. Old vectors must not be mixed
 
 The script replaces each document's chunks atomically and reports missing files rather than silently dropping them. If a source file is missing, re-upload it through the application before proceeding. Scanned PDFs can use optional local OCR through PyMuPDF + Tesseract. On macOS, install the Tesseract binary (for example, brew install tesseract); then verify its language packs with tesseract --list-langs. Set OCR_LANG=eng+hin only when both language packs are installed. If Tesseract is unavailable or OCR returns no text, ingestion reports that no readable text was indexed rather than claiming success.
 
+
+### Intelligent query clarification
+
+The chat now performs a lightweight query-understanding check before embedding or database retrieval. With `RAG_QUERY_CLARIFICATION_ENABLED=true`, the configured Ollama model normalizes clear typos, resolves follow-up references from the last chat turns, and asks one specific follow-up when a query is materially ambiguous or unreadable. A clarification response has `clarification_needed=true`, no sources, and `chunks_used=0`; no document retrieval occurs until the user clarifies. Recent turns are sent through Spring Boot to FastAPI, and a reply to a pending clarification is combined with the original question. If Ollama's classifier is unavailable, obvious incomplete prompts still receive a deterministic clarification and other queries fall back to their original text.
+
+The query-understanding preflight adds a model call before normal answer generation. Disable it with `RAG_QUERY_CLARIFICATION_ENABLED=false` if the extra latency is unsuitable. The UI should preserve the `clarificationNeeded` response flag and send recent user/assistant turns for the feature to work across multiple turns.
+
 ### Regression tests
 
 \`\`\`bash
