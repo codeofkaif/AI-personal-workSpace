@@ -1043,7 +1043,7 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
         }
         # Explicitly control thinking mode for reasoning models (Qwen, DeepSeek, etc.)
         think_enabled = (
-            os.getenv("OLLAMA_THINK", "false").strip().lower()
+            os.getenv("OLLAMA_THINK", "true").strip().lower()
             in {"1", "true", "yes", "on"}
         )
         if OLLAMA_MODEL.lower().startswith(("qwen", "deepseek")):
