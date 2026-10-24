@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from functools import wraps
+from pathlib import Path
 import os
 import json
 import logging
@@ -19,8 +20,20 @@ import shutil
 import time
 from threading import BoundedSemaphore, Lock
 
+# Ensure environment variables are loaded from root .env
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()
+except ImportError:
+    pass
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 app = FastAPI(
     title="AI Personal Workspace — RAG Service",
@@ -85,10 +98,10 @@ RAG_CONTEXT_TOKEN_BUDGET = max(128, int(os.getenv("RAG_CONTEXT_TOKEN_BUDGET", "1
 
 RAG_API_KEY = os.getenv("RAG_API_KEY", "")
 RAG_ENV = os.getenv("RAG_ENV", "development").lower()
-OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "350"))))
-OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")))
+OLLAMA_NUM_PREDICT = max(64, min(2048, int(os.getenv("OLLAMA_NUM_PREDICT", "450"))))
+OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120")))
 RAG_WARMUP_ON_STARTUP = os.getenv("RAG_WARMUP_ON_STARTUP", "false").lower() in {"1", "true", "yes"}
-RAG_MAX_CONCURRENT_QUERIES = max(1, int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "2")))
+RAG_MAX_CONCURRENT_QUERIES = max(1, int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "1")))
 RAG_MAX_CONCURRENT_INGESTIONS = max(1, int(os.getenv("RAG_MAX_CONCURRENT_INGESTIONS", "1")))
 _QUERY_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_QUERIES)
 _INGEST_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_INGESTIONS)
@@ -234,39 +247,53 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
     return profile
 
 def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
-    """Detect genuine self-profile questions without matching common English filler words."""
-    q_lower = q.lower()
+    """
+    Detect genuine self-profile and personal queries:
+    - English phrases: 'for me', 'about me', 'about myself', 'who am i', 'what about me',
+      'my skills', 'my projects', 'my experience', 'my resume', 'my education', 'my background',
+      'what did i upload', 'my documents', etc.
+    - Hindi / Hinglish phrases: 'mere baare mein', 'apne baare me', 'mera project', 'meri skills',
+      'mera resume', 'main kaun hu', 'mera detail', 'maine kya upload kiya', etc.
+    - Queries mentioning the user's name or first name.
+    """
+    q_lower = q.lower().strip()
     name = (profile.get("name") or "").strip().lower()
     first_name = name.split()[0] if name else ""
 
-    # Do not treat common phrases like "tell me..." or "main method" as personal-profile requests.
-    self_phrases = (
-        "who am i", "who i am", "about me", "about myself", "what do you know about me",
-        "my profile", "mera profile", "meri profile", "my role", "mera role", "meri role",
-        "my resume", "mera resume", "meri resume", "my placement", "mera placement", "meri placement",
-        "my score", "mera score", "mere bare", "mere baare", "mere baare mein",
-        "my cgpa", "mera cgpa", "my scholarship", "meri scholarship",
-        "my fees", "meri fees", "my timetable", "mera timetable", "meri timetable",
-        "my name", "mera naam", "meri details", "my details",
-        "main kaun hu", "mai kaun hu", "main kaun hoon", "mai kaun hoon",
-        "main kya hu", "mai kya hu", "mera kya status", "meri kya status"
-    )
-    if name and re.search(r"\b" + re.escape(name) + r"\b", q_lower):
+    if name and len(name) > 2 and re.search(r"\b" + re.escape(name) + r"\b", q_lower):
         return True
-    if first_name and len(first_name) > 2 and re.search(r"\b" + re.escape(first_name) + r"\b", q_lower):
-        return True
-    if any(phrase in q_lower for phrase in self_phrases):
-        return True
+    if first_name and len(first_name) > 2 and first_name not in {"user", "admin", "student"}:
+        if re.search(r"\b" + re.escape(first_name) + r"\b", q_lower):
+            return True
+
+    direct_patterns = [
+        r"\b(for\s+me|about\s+me|about\s+myself|who\s+am\s+i|who\s+i\s+am|what\s+about\s+me|tell\s+me\s+about\s+me|tell\s+me\s+about\s+myself|details\s+of\s+me|details\s+for\s+me|what\s+do\s+you\s+know\s+about\s+me|introduce\s+me|whoami)\b",
+        r"\b(my|mine)\s+(profile|role|resume|cv|skills?|tech\s+stack|projects?|experience|work|education|qualifications?|degree|background|bio|details?|info|information|achievements?|certifications?|certificates?|strengths?|score|cgpa|marks|placement|scholarship|fees|timetable|attendance|roll(?:\s+number)?|department|branch|college|university|name|contact|email|phone|uploads?|documents?)\b",
+        r"\b(what|which)\s+(skills?|projects?|documents?|files?)\s+(do\s+i|have\s+i|did\s+i)\b",
+        r"\b(what\s+have\s+i\s+done|what\s+did\s+i\s+upload|what\s+documents?\s+did\s+i\s+upload|what\s+are\s+my\s+skills|what\s+is\s+my)\b",
+        r"\b(mera|meri|mere|apna|apni|apne)\s+(profile|role|resume|cv|skills?|projects?|experience|kaam|padhai|education|qualification|background|detail|details|info|score|cgpa|marks|placement|scholarship|fees|timetable|attendance|roll(?:\s*no|\s*number)?|department|college|naam|documents?|uploads?|kya\s+hai|batao|dikhao)\b",
+        r"\b(mere|apne)\s+ba?are\s*(me|mein)\b",
+        r"\b(mai|main)\s+(kaun|kya)\s+(hu|hoon)\b",
+        r"\b(maine\s+kya\s+upload\s+kiya|mere\s+uploaded\s+docs?|mera\s+summary|meri\s+summary)\b",
+    ]
+
+    for pat in direct_patterns:
+        if re.search(pat, q_lower):
+            return True
 
     words = set(re.findall(r"\b\w+\b", q_lower))
     if words & {"mera", "meri", "mere", "apne", "apna", "apni"}:
-        return True
-    # English "my" is only a signal when paired with an actual profile field.
-    profile_fields = {
-        "profile", "role", "resume", "placement", "score", "cgpa", "scholarship",
-        "fees", "timetable", "attendance", "roll", "department", "marks", "name"
-    }
-    return "my" in words and bool(words & profile_fields)
+        profile_words = {
+            "profile", "role", "resume", "cv", "placement", "score", "cgpa", "scholarship",
+            "fees", "timetable", "attendance", "roll", "department", "marks", "name", "naam",
+            "skill", "skills", "project", "projects", "experience", "kaam", "padhai",
+            "doc", "docs", "document", "documents", "detail", "details", "info", "summary",
+            "kaun", "status", "kya", "batao", "dikhao"
+        }
+        if words & profile_words:
+            return True
+
+    return False
 
 def _ocr_pdf_page(file_bytes: bytes, page_index: int) -> str:
     """Optional local OCR fallback. Requires PyMuPDF and the system Tesseract binary."""
@@ -440,7 +467,8 @@ def _metadata_dict(metadata: Any) -> Dict[str, Any]:
 _RERANKER = None
 _RERANKER_LOCK = Lock()
 
-def _rerank_candidates(question: str, candidates: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+def _rerank_candidates(question: str, candidates: List[Dict[str, Any]], limit: int,
+                       is_self: bool = False, user_profile: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Optional cross-encoder reranking; RRF order remains the safe fallback."""
     global _RERANKER
     if not RERANK_ENABLED or len(candidates) < 2:
@@ -452,12 +480,17 @@ def _rerank_candidates(question: str, candidates: List[Dict[str, Any]], limit: i
                     from sentence_transformers import CrossEncoder
                     _RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
                     logger.info("Loaded local reranker %s", RERANKER_MODEL_NAME)
-        pairs = [(question, item.get("content", "")) for item in candidates]
+        rerank_query = question
+        if is_self and user_profile:
+            name = user_profile.get("name", "student")
+            rerank_query = f"Academic background, skills, projects, and career profile of {name}: {question}"
+        pairs = [(rerank_query, item.get("content", "")) for item in candidates]
         scores = _RERANKER.predict(pairs, batch_size=8, show_progress_bar=False)
         ranked = []
         for item, score in zip(candidates, scores):
             candidate = dict(item)
-            candidate["rerank_score"] = float(score)
+            personal_boost = 1.0 if (is_self and candidate.get("is_personal")) else 0.0
+            candidate["rerank_score"] = float(score) + personal_boost
             ranked.append(candidate)
         ranked.sort(key=lambda item: item["rerank_score"], reverse=True)
         return ranked[:limit]
@@ -491,7 +524,8 @@ def _scope_filter(user_id: Optional[int], scope: str) -> tuple[str, tuple]:
     return f"({personal} OR {college})", (user_id, user_id, user_id, user_id)
 
 def retrieve_context(question: str, question_embedding: List[float], user_id: Optional[int],
-                     scope: str, top_k: int) -> List[Dict[str, Any]]:
+                     scope: str, top_k: int, is_self: bool = False,
+                     user_profile: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Retrieve dense and lexical candidates; fuse rankings with Reciprocal Rank Fusion."""
     conn = get_db_connection()
     if not conn:
@@ -548,13 +582,80 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
                     "rrf_score": 1.0 / (60 + rank), "retrieval_methods": ["keyword"],
                     "lexical_score": float(lexical_score or 0.0)
                 }
+
+        # If query is self-referential, pull the user's personal documents (resume, projects, certificates, etc.)
+        if is_self and user_id:
+            personal_sql = f"""
+                SELECT dc.id, dc.content, dc.metadata,
+                       1 - (dc.embedding <=> %s::vector) AS similarity,
+                       dc.document_id, dc.chunk_index, dc.page_number
+                FROM document_chunks dc
+                JOIN documents d ON dc.document_id = d.id
+                WHERE d.user_id = %s
+                  AND COALESCE(d.is_college_doc, FALSE) IS NOT TRUE
+                  AND dc.embedding_model = %s
+                ORDER BY (
+                    CASE
+                        WHEN LOWER(d.title) LIKE '%%resume%%' OR LOWER(d.title) LIKE '%%cv%%' THEN 1
+                        WHEN LOWER(d.title) LIKE '%%project%%' THEN 2
+                        ELSE 3
+                    END
+                ), dc.chunk_index ASC
+                LIMIT %s
+            """
+            cur.execute(personal_sql, (question_embedding, user_id, EMBEDDING_MODEL_NAME, candidate_k))
+            for rank, row in enumerate(cur.fetchall(), start=1):
+                chunk_id, content, metadata, similarity, doc_id, chunk_index, page_number = row
+                if chunk_id in fused:
+                    fused[chunk_id]["rrf_score"] += 1.0 / (20 + rank)  # High RRF boost for owner's personal docs
+                    fused[chunk_id]["is_personal"] = True
+                else:
+                    fused[chunk_id] = {
+                        "id": chunk_id, "content": content or "", "metadata": _metadata_dict(metadata),
+                        "similarity": float(similarity) if similarity is not None else 0.75,
+                        "document_id": doc_id, "chunk_index": chunk_index, "page_number": page_number,
+                        "rrf_score": 1.0 / (20 + rank), "retrieval_methods": ["personal_profile"],
+                        "is_personal": True
+                    }
+
         cur.close()
         candidates = sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)
         candidates = [
             item for item in candidates
-            if item["similarity"] >= RAG_SIMILARITY_THRESHOLD or "keyword" in item["retrieval_methods"]
+            if item["similarity"] >= RAG_SIMILARITY_THRESHOLD or "keyword" in item["retrieval_methods"] or item.get("is_personal")
         ]
-        candidates = _rerank_candidates(question, candidates, top_k)
+
+        # Safety fallback: If self-referential and no candidates passed, ensure user's personal chunks are present
+        if not candidates and is_self and user_id:
+            conn2 = get_db_connection()
+            if conn2:
+                try:
+                    c2 = conn2.cursor()
+                    c2.execute("""
+                        SELECT dc.id, dc.content, dc.metadata,
+                               0.80 AS similarity, dc.document_id, dc.chunk_index, dc.page_number
+                        FROM document_chunks dc
+                        JOIN documents d ON dc.document_id = d.id
+                        WHERE d.user_id = %s AND COALESCE(d.is_college_doc, FALSE) IS NOT TRUE
+                        ORDER BY dc.chunk_index ASC
+                        LIMIT %s
+                    """, (user_id, top_k))
+                    for row in c2.fetchall():
+                        chunk_id, content, metadata, similarity, doc_id, chunk_index, page_number = row
+                        candidates.append({
+                            "id": chunk_id, "content": content or "", "metadata": _metadata_dict(metadata),
+                            "similarity": similarity, "document_id": doc_id, "chunk_index": chunk_index,
+                            "page_number": page_number, "rrf_score": 0.5, "retrieval_methods": ["direct_personal"],
+                            "is_personal": True
+                        })
+                    c2.close()
+                    conn2.close()
+                except Exception as e:
+                    logger.warning(f"Direct personal fallback failed: {e}")
+                    if conn2:
+                        conn2.close()
+
+        candidates = _rerank_candidates(question, candidates, top_k, is_self=is_self, user_profile=user_profile)
         for item in candidates:
             meta = item["metadata"]
             item["filename"] = meta.get("filename") or meta.get("title") or "Document"
@@ -844,7 +945,8 @@ def query_ai(req: QueryRequest):
         # 2. Retrieve authorized candidates with hybrid dense + lexical RRF ranking.
         requested_k = max(1, min(int(req.top_k or 5), 8))
         context_items = retrieve_context(
-            req.question, question_embedding, req.user_id, scope, requested_k
+            req.question, question_embedding, req.user_id, scope, requested_k,
+            is_self=is_self, user_profile=user_profile
         )
         context_items = select_context_items(context_items)
         sources = []
@@ -868,7 +970,7 @@ def query_ai(req: QueryRequest):
         raise HTTPException(status_code=500, detail="AI query failed due to an internal error.") from e
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen3:4b-instruct-2507-q4_K_M")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen3.5:9b-q4_K_M")
 
 def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[str]:
     """Call local Ollama API with tuned generation parameters"""
@@ -887,9 +989,14 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
                 "repeat_penalty": 1.08,
             }
         }
-        # Qwen3 supports explicitly disabling its thinking mode for lower latency.
-        if OLLAMA_MODEL.lower().startswith("qwen3"):
-            payload["think"] = False
+        # Explicitly control thinking mode for reasoning models (Qwen, DeepSeek, etc.)
+        think_enabled = (
+            os.getenv("OLLAMA_THINK", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if OLLAMA_MODEL.lower().startswith(("qwen", "deepseek")):
+            payload["think"] = think_enabled
+
         started = time.perf_counter()
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
@@ -905,7 +1012,10 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
                 OLLAMA_MODEL, elapsed_ms, result.get("prompt_eval_count"),
                 result.get("eval_count"), result.get("total_duration"), result.get("load_duration")
             )
-            return result.get("response", "").strip()
+            raw_response = result.get("response", "").strip()
+            if not raw_response and result.get("thinking"):
+                raw_response = result.get("thinking", "").strip()
+            return raw_response
         logger.warning("Ollama returned status=%s after %.1f ms", resp.status_code, elapsed_ms)
     except Exception as e:
         logger.warning(f"Ollama call failed: {e}")
@@ -945,8 +1055,10 @@ def clean_and_format_answer(answer: str) -> str:
     """Ensure the answer is clean, professional, and properly structured in Markdown"""
     if not answer:
         return ""
+    # Strip <think>...</think> reasoning blocks from Qwen/DeepSeek models
+    answer = re.sub(r'<think>[\s\S]*?</think>', '', answer, flags=re.IGNORECASE)
     # Strip prompt prefix leakage
-    answer = re.sub(r'^(STRUCTURED GROUNDED RESPONSE:|FRIENDLY & STRUCTURED ANSWER:|STRUCTURED & CLEAN ANSWER:|ANSWER:|Response:)\s*', '', answer, flags=re.IGNORECASE)
+    answer = re.sub(r'^(STRUCTURED GROUNDED RESPONSE:|FRIENDLY & STRUCTURED ANSWER:|STRUCTURED & CLEAN ANSWER:|STRUCTURED & FACTUAL RESPONSE:|ANSWER:|Response:)\s*', '', answer, flags=re.IGNORECASE)
     # Ensure double newlines before bullets/numbered items for clean markdown rendering
     answer = re.sub(r'([^\n])\n([•\-\*]|\d+\.)', r'\1\n\n\2', answer)
     # Strip excessive empty lines
@@ -1034,7 +1146,8 @@ def generate_answer(
     is_self: bool = False
 ) -> str:
     """Production RAG Answer Generation with Advanced Prompt Engineering & Source Citations"""
-    first_name = user_profile.get('name', 'Student').split()[0]
+    user_name = user_profile.get('name', 'Student')
+    first_name = user_name.split()[0] if user_name else 'Student'
     if not context_items and not is_self:
         return (
             f"⚠️ **Relevant Information Not Found**\n\n"
@@ -1057,7 +1170,7 @@ def generate_answer(
             f"💡 *Apni details verify karne ke liye relevant document upload karein.*"
         )
 
-    # Prioritize top 4 most relevant excerpts to prevent context dilution
+    # Prioritize top excerpts to prevent context dilution
     formatted_excerpts = []
     for i, item in enumerate(context_items[:RAG_CONTEXT_CHUNKS], 1):
         fn = item.get("filename", "Uploaded Document")
@@ -1068,6 +1181,18 @@ def generate_answer(
 
     context_str = "\n\n".join(formatted_excerpts)
 
+    self_identity_instruction = ""
+    if is_self:
+        self_identity_instruction = f"""
+CRITICAL IDENTITY & PROFILE OWNERSHIP (MANDATORY):
+- The authenticated user is currently logged into their profile as: {user_name} ({user_profile.get('role', 'STUDENT')}).
+- ALL personal documents uploaded in this profile (resumes, CVs, certificates, project files, admit cards, transcripts, etc.) BELONG DIRECTLY TO THIS LOGGED-IN USER.
+- The details inside these uploaded documents (skills, projects, work experience, education, contact info, achievements) represent THIS USER'S OWN authentic career and academic record.
+- Even if a document lists minor name variations (e.g., 'Md. Kaif Ali' or similar vs '{user_name}'), treat the document contents as belonging to THIS authenticated user.
+- When answering this question ("for me", "about me", "my skills", "who am I", "my projects", "mere baare mein", "apne baare mein", etc.), address the user directly ("You / Aap") and provide THEIR OWN details, skills, experience, projects, and education directly from the uploaded documents.
+- DO NOT claim that the documents belong to someone else, and DO NOT ask the user to verify if this is their name. Present their details confidently, cleanly, and accurately!
+"""
+
     prompt = f"""You are an expert Academic & Career Intelligence AI Assistant for college students in AI Workspace.
 AUTHENTICATED STUDENT:
 - Full Name: {user_profile.get('name', 'Student')}
@@ -1076,10 +1201,11 @@ AUTHENTICATED STUDENT:
 - Roll Number: {user_profile.get('roll_number') or 'Not available'}
 - Current CGPA: {user_profile.get('cgpa') if user_profile.get('cgpa') is not None else 'Not available'}
 - University: {user_profile.get('college') or 'Not available'}
-
+{self_identity_instruction}
 CRITICAL INSTRUCTIONS:
 1. EVIDENCE AND ACCURACY:
    - Answer from the supplied document excerpts and verified profile fields only.
+   - When the user asks about themselves, present the evidence from their uploaded documents as their personal details.
    - If evidence is missing or conflicting, say so plainly; do not guess or extrapolate.
    - Cite source documents using the exact label syntax [Source: exact-filename].
    - Never invent a filename, page number, URL, qualification, placement eligibility, score, or personal detail.

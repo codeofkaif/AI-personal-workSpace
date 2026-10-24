@@ -6,11 +6,13 @@ import com.aiworkplace.entity.User;
 import com.aiworkplace.service.*;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.server.ResponseStatusException;
 import java.util.Map;
 
 @RestController
@@ -36,7 +38,11 @@ public class AIController {
                                                        @RequestParam("file") MultipartFile file) {
         User user = authService.getCurrentUser(userDetails.getUsername());
         int chunks = aiClientService.ingestDocument(file, user.getId());
-        return ResponseEntity.ok(Map.of("success", chunks >= 0, "chunks", chunks, "file", file.getOriginalFilename()));
+        if (chunks <= 0) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                "The document was not indexed. Verify that RAG is healthy and the file contains readable text.");
+        }
+        return ResponseEntity.ok(Map.of("success", true, "chunks", chunks, "file", file.getOriginalFilename()));
     }
 
     @GetMapping("/status")

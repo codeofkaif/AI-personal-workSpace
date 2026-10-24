@@ -14,7 +14,9 @@ Thumbs.db
 # --- Environment & Secret Variables ---
 .env
 .env.*
-!.env.example
+
+# --- Database Backups ---
+backups/
 
 # --- Node.js & Frontend (React / Vite) ---
 node_modules/
@@ -43,7 +45,6 @@ uploads/*
 
 # --- Spring Boot Secrets (local config with passwords) ---
 backend/src/main/resources/application.properties
-!backend/src/main/resources/application.properties.example
 
 # --- Python & FastAPI (RAG Service) ---
 rag-service/evaluation/latest-report.json
@@ -94,3 +95,5 @@ htmlcov/
 *.sln
 *.sw?
 *~
+# Vite local env
+.env.local

@@ -7,8 +7,10 @@ import com.aiworkplace.repository.DocumentRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -48,15 +50,8 @@ public class DocumentService {
             .build();
         doc = documentRepository.save(doc);
 
-        // 3. Ingest into RAG (FastAPI) — send the original MultipartFile
-        int chunks = aiClientService.ingestDocument(file, user.getId(), doc.getId());
-        if (chunks < 0) {
-            log.warn("RAG ingest failed for doc id={}, proceeding without vector index.", doc.getId());
-        } else {
-            log.info("RAG ingested {} chunks for doc id={}", chunks, doc.getId());
-        }
-
-        return toResponse(doc);
+        // 3. An upload is successful only when it is searchable immediately.
+        return requireIndexed(file, user, doc, filePath);
     }
 
     /**
@@ -82,11 +77,8 @@ public class DocumentService {
             .build();
         doc = documentRepository.save(doc);
 
-        // 3. Ingest into RAG
-        int chunks = aiClientService.ingestDocument(file, admin.getId(), doc.getId());
-        log.info("College doc ingested: {} chunks for doc id={}", chunks, doc.getId());
-
-        return toResponse(doc);
+        // 3. Publish shared documents only after their index is complete.
+        return requireIndexed(file, admin, doc, filePath);
     }
 
     public List<DocumentResponse> getDocumentsByUser(Long userId) {
@@ -113,6 +105,33 @@ public class DocumentService {
             );
         }
         documentRepository.delete(doc);
+    }
+
+    private DocumentResponse requireIndexed(MultipartFile file, User owner, Document doc, Path filePath) {
+        int chunks = aiClientService.ingestDocument(file, owner.getId(), doc.getId());
+        if (chunks > 0) {
+            log.info("RAG indexed {} chunks for document id={}", chunks, doc.getId());
+            return toResponse(doc);
+        }
+
+        cleanupFailedUpload(doc, filePath);
+        String detail = chunks == 0
+            ? "No readable text could be indexed. This is usually a scanned/image-only PDF; install OCR or upload a text-based PDF, DOCX, TXT, or MD file."
+            : "The RAG indexing service is unavailable. The document was not saved; retry after RAG is healthy.";
+        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, detail);
+    }
+
+    private void cleanupFailedUpload(Document doc, Path filePath) {
+        try {
+            documentRepository.deleteById(doc.getId());
+        } catch (RuntimeException e) {
+            log.error("Could not remove unindexed document record id={}", doc.getId(), e);
+        }
+        try {
+            Files.deleteIfExists(filePath);
+        } catch (IOException e) {
+            log.error("Could not remove unindexed upload {}", filePath, e);
+        }
     }
 
     private DocumentResponse toResponse(Document d) {
