@@ -71,6 +71,8 @@ RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.10"))
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() in {"1", "true", "yes"}
 RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 RAG_CANDIDATE_K = min(50, max(1, RAG_CANDIDATE_K))
+RAG_API_KEY = os.getenv("RAG_API_KEY", "")
+RAG_ENV = os.getenv("RAG_ENV", "development").lower()
 OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "350"))))
 OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")))
 
@@ -219,7 +221,7 @@ def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
         return True
     if any(phrase in q_lower for phrase in self_phrases):
         return True
-    words = set(re.findall(r"\\b\\w+\\b", q_lower))
+    words = set(re.findall(r"\b\w+\b", q_lower))
     return bool(words & self_words)
 
 def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
