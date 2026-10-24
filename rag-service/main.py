@@ -81,11 +81,14 @@ def get_model():
         logger.info("Embedding model %s ready (dimension=%s)", EMBEDDING_MODEL_NAME, dimension)
     return _embedding_model
 
-def get_embedding(text: str) -> List[float]:
-    """Return a normalized embedding or fail; never index/search with a fake zero vector."""
+def get_embedding(text: str, is_query: bool = False) -> List[float]:
+    """Return a normalized embedding; add E5 prefixes when that model is selected."""
     if not text or not text.strip():
         raise ValueError("Cannot embed empty text")
-    values = get_model().encode(text, normalize_embeddings=True, convert_to_numpy=True).tolist()
+    model_input = text
+    if "multilingual-e5" in EMBEDDING_MODEL_NAME.lower() or "e5-small" in EMBEDDING_MODEL_NAME.lower():
+        model_input = ("query: " if is_query else "passage: ") + text
+    values = get_model().encode(model_input, normalize_embeddings=True, convert_to_numpy=True).tolist()
     if len(values) != EMBEDDING_DIMENSION:
         raise RuntimeError("Embedding dimension mismatch")
     return values
