@@ -446,6 +446,10 @@ def ensure_chunk_schema(conn) -> None:
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_document_id ON document_chunks (document_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_fts ON document_chunks USING GIN (to_tsvector('simple', COALESCE(content, '')))")
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_hnsw ON document_chunks USING hnsw (embedding vector_cosine_ops)")
+    except Exception as e:
+        logger.warning("Could not create HNSW index on document_chunks: %s", e)
     conn.commit()
     cur.close()
 
@@ -489,13 +493,14 @@ def _rerank_candidates(question: str, candidates: List[Dict[str, Any]], limit: i
             with _RERANKER_LOCK:
                 if _RERANKER is None:
                     from sentence_transformers import CrossEncoder
-                    _RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
+                    _RERANKER = CrossEncoder(RERANKER_MODEL_NAME, max_length=512)
                     logger.info("Loaded local reranker %s", RERANKER_MODEL_NAME)
         rerank_query = question
         if is_self and user_profile:
             name = user_profile.get("name", "student")
             rerank_query = f"Academic background, skills, projects, and career profile of {name}: {question}"
-        pairs = [(rerank_query, item.get("content", "")) for item in candidates]
+        # Truncate content to ~1200 characters to comfortably fit 512 token limit and speed up inference
+        pairs = [(rerank_query, (item.get("content") or "")[:1200]) for item in candidates]
         scores = _RERANKER.predict(pairs, batch_size=8, show_progress_bar=False)
         ranked = []
         for item, score in zip(candidates, scores):
@@ -1331,7 +1336,7 @@ def warm_up_rag_models():
             with _RERANKER_LOCK:
                 if _RERANKER is None:
                     from sentence_transformers import CrossEncoder
-                    _RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
+                    _RERANKER = CrossEncoder(RERANKER_MODEL_NAME, max_length=512)
             _RERANKER.predict([("warm up query", "warm up document")], show_progress_bar=False)
             logger.info("Reranker warm-up complete")
         except Exception:
