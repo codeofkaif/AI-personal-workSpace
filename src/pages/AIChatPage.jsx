@@ -73,7 +73,9 @@ export default function AIChatPage() {
       .slice(-8)
       .map(m => ({
         role: m.role === 'user' ? 'user' : 'assistant',
-        content: m.content,
+        // The classifier needs only a short history excerpt; cap each turn so
+        // a long generated answer cannot violate FastAPI's history size limits.
+        content: String(m.content || '').slice(0, 1000),
         clarification_needed: m.role === 'ai' && Boolean(m.clarificationNeeded),
       }))
 
