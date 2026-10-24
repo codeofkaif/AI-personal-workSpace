@@ -127,12 +127,15 @@ def get_db_connection():
             user=os.getenv("DB_USER", "kaifkhan"),
             password=os.getenv("DB_PASSWORD", "")
         )
-        # The extension must exist before register_vector can discover its PostgreSQL type.
-        with conn.cursor() as cursor:
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        conn.commit()
         from pgvector.psycopg2 import register_vector
-        register_vector(conn)
+        try:
+            register_vector(conn)
+        except Exception:
+            # First-time setup only: create the extension if DB initialization was missed.
+            with conn.cursor() as cursor:
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.commit()
+            register_vector(conn)
         return conn
     except Exception as e:
         logger.error(f"DB connection failed: {e}")
