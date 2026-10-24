@@ -42,6 +42,7 @@ uploads/*
 !uploads/.gitignore
 
 # --- Python & FastAPI (RAG Service) ---
+rag-service/evaluation/latest-report.json
 __pycache__/
 **/__pycache__/
 *.py[cod]
