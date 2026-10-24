@@ -1033,4 +1033,9 @@ STRUCTURED & FACTUAL RESPONSE:"""
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("RAG_HOST", "127.0.0.1"),
+        port=int(os.getenv("RAG_PORT", "8000")),
+        reload=os.getenv("RAG_RELOAD", "true").lower() in {"1", "true", "yes"} and RAG_ENV != "production",
+    )
