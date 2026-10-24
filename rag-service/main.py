@@ -877,6 +877,15 @@ def understand_query(question: str, conversation_history: List[ConversationTurn]
     """Return normalized text or a clarification question before database retrieval."""
     history = _history_as_dicts(conversation_history)
     pending = _pending_clarification_query(question, history)
+    if pending and _AFFIRMATIVE_ONLY_RE.fullmatch((question or "").strip()):
+        return {
+            "action": "clarify",
+            "normalized_query": None,
+            "clarification_question": (
+                "I still need the specific option or topic. Could you name it in a few words, "
+                "rather than replying only “yes”?"
+            ),
+        }
     if pending:
         # Re-evaluate the combined intent so a plain "yes" doesn't guess which option was meant.
         if RAG_QUERY_CLARIFICATION_ENABLED:
