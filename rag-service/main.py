@@ -655,22 +655,6 @@ def _pending_clarification_query(question: str, history: List[Dict[str, Any]]) -
     return f"Original request: {original}\nUser clarification: {question.strip()}"
 
 
-def _needs_clarity_preflight(question: str, history: List[Dict[str, Any]]) -> bool:
-    """Use an extra model call only for short, referential, or potentially garbled input."""
-    normalized = re.sub(r"\s+", " ", (question or "").strip())
-    if not normalized or _GREETING_RE.fullmatch(normalized):
-        return False
-    words = re.findall(r"[\w'-]+", normalized, flags=re.UNICODE)
-    if len(words) <= 5:
-        return True
-    if _REFERENTIAL_QUERY_RE.search(normalized):
-        return True
-    alnum = sum(char.isalnum() or char.isspace() or char in ".,?!'-_/" for char in normalized)
-    if normalized and alnum / len(normalized) < 0.78:
-        return True
-    return False
-
-
 def _obvious_clarification(question: str, has_history: bool) -> Optional[str]:
     """Deterministic fallback for obvious incomplete prompts when Ollama is unavailable."""
     normalized = re.sub(r"\s+", " ", (question or "").strip())
@@ -690,7 +674,7 @@ def _obvious_clarification(question: str, has_history: bool) -> Optional[str]:
 
 
 def _classify_query_clarity(question: str, history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Ask Ollama to normalize or clarify only likely-ambiguous input; JSON is validated below."""
+    """Ask Ollama to normalize or clarify input before retrieval; validate its JSON response."""
     try:
         import httpx
         history_lines = []
@@ -768,7 +752,17 @@ def understand_query(
     history = _history_as_dicts(conversation_history)
     resumed = _pending_clarification_query(question, history)
     if resumed:
+        if RAG_QUERY_CLARIFICATION_ENABLED:
+            # Re-classify the combined intent so a response like "yes" cannot silently
+            # resolve a two-option clarification without choosing one.
+            classified = _classify_query_clarity(resumed, history)
+            if classified:
+                return classified
         return {"action": "answer", "normalized_query": resumed, "clarification_question": None}
+
+    normalized = re.sub(r"\s+", " ", (question or "").strip())
+    if _GREETING_RE.fullmatch(normalized):
+        return {"action": "answer", "normalized_query": normalized, "clarification_question": None}
 
     fallback = _obvious_clarification(question, has_history=bool(history))
     if fallback:
