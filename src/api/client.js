@@ -179,10 +179,10 @@ export const documentsApi = {
 
 // ── AI / RAG API ──────────────────────────────────────────────────────────────
 export const aiApi = {
-  chat: (question, topK = 5, scope = 'College + Personal') =>
+  chat: (question, topK = 5, scope = 'College + Personal', conversationHistory = []) =>
     apiFetch('/api/ai/chat', {
       method: 'POST',
-      body: JSON.stringify({ question, topK, scope }),
+      body: JSON.stringify({ question, topK, scope, conversationHistory }),
     }),
   status: () => apiFetch('/api/ai/status'),
   ragHealth: () =>
