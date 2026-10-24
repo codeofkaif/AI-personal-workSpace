@@ -253,6 +253,12 @@ The embedding model and chunking strategy changed. Old vectors must not be mixed
 
 The script replaces each document's chunks atomically and reports missing files rather than silently dropping them. If a source file is missing, re-upload it through the application before proceeding. Scanned PDFs can use optional local OCR through PyMuPDF + Tesseract. On macOS, install the Tesseract binary (for example, brew install tesseract); then verify its language packs with tesseract --list-langs. Set OCR_LANG=eng+hin only when both language packs are installed. If Tesseract is unavailable or OCR returns no text, ingestion reports that no readable text was indexed rather than claiming success.
 
+### Intelligent query clarification
+
+The chat can ask a follow-up before document retrieval when a query is materially ambiguous, missing context, or difficult to interpret. Clear queries with obvious typos are normalized and sent through the normal RAG path. Recent user/assistant turns are passed from React through Spring Boot to FastAPI so follow-ups such as “what are its drawbacks?” can be resolved from the chat context.
+
+Configure `RAG_QUERY_CLARIFICATION_ENABLED=true` in the root `.env` to enable the pre-retrieval classifier. It uses the configured Ollama model with a small context/output budget; this adds a model call for short, referential, or potentially garbled queries. If the classifier is unavailable, the service uses deterministic clarification for obviously incomplete prompts and otherwise falls back to the original query. A clarification API response has `clarification_needed=true`, an empty source list, and `chunks_used=0`; no vector/keyword search or answer generation is performed for that turn. The user’s next reply should name the intended topic/option rather than just “yes”.
+
 ### Regression tests
 
 \`\`\`bash

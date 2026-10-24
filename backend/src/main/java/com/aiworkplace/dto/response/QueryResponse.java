@@ -6,4 +6,5 @@ public class QueryResponse {
     private String answer;
     private List<String> sources;
     private String conversationId;
+    private boolean clarificationNeeded;
 }

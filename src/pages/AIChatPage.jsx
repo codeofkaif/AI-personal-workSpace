@@ -67,12 +67,25 @@ export default function AIChatPage() {
     setLoading(true)
     setSources([])
 
+    // Include recent turns for follow-ups; the current text is already sent as the question.
+    const conversationHistory = messages
+      .filter(m => m.role === 'user' || m.role === 'ai')
+      .slice(-8)
+      .map(m => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        // The classifier needs only a short history excerpt; cap each turn so
+        // a long generated answer cannot violate FastAPI's history size limits.
+        content: String(m.content || '').slice(0, 1000),
+        clarification_needed: m.role === 'ai' && Boolean(m.clarificationNeeded),
+      }))
+
     try {
-      const res = await aiApi.chat(text, 5, scope)
+      const res = await aiApi.chat(text, 5, scope, conversationHistory)
       const aiMsg = {
         id: Date.now() + 1,
         role: 'ai',
         content: res?.answer || 'No answer received from AI.',
+        clarificationNeeded: Boolean(res?.clarificationNeeded),
         sourcesRaw: res?.sources || [],
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       }
@@ -254,7 +267,7 @@ export default function AIChatPage() {
                   <div className="flex items-center justify-between pb-2.5 mb-3 border-b border-gray-100">
                     <div className="flex items-center gap-1.5 text-amber-600 font-bold text-xs">
                       <Sparkles size={14} className="text-amber-500" />
-                      <span>AI Assistant</span>
+                      <span>{msg.clarificationNeeded ? 'Clarification Needed' : 'AI Assistant'}</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <span className="text-[10px] text-gray-400 font-medium">{msg.timestamp}</span>
@@ -285,7 +298,7 @@ export default function AIChatPage() {
                     </div>
                   )}
 
-                  {msg.sourcesRaw?.length === 0 && (
+                  {!msg.clarificationNeeded && msg.sourcesRaw?.length === 0 && (
                     <p className="text-[10px] text-gray-400 mt-3 italic">
                       Direct AI Workspace query response.
                     </p>
