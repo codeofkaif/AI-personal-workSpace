@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Que
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from functools import wraps
 from pathlib import Path
 import os
@@ -51,17 +51,26 @@ app.add_middleware(
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
+class ConversationTurn(BaseModel):
+    role: Literal["user", "assistant"] = "user"
+    content: str = Field(min_length=1, max_length=4000)
+    clarification_needed: bool = False
+
+
 class QueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     user_id: Optional[int] = Field(default=None, gt=0)
     top_k: int = Field(default=5, ge=1, le=8)
     user_profile: Optional[Dict[str, Any]] = None
     scope: str = Field(default="College + Personal", pattern="^(Personal Only|College Only|College \\+ Personal)$")
+    conversation_history: List[ConversationTurn] = Field(default_factory=list, max_length=8)
+
 
 class QueryResponse(BaseModel):
     answer: str
     sources: List[str] = []
     chunks_used: int = 0
+    clarification_needed: bool = False
 
 class IngestResponse(BaseModel):
     success: bool
@@ -104,6 +113,7 @@ RAG_WARMUP_ON_STARTUP = os.getenv("RAG_WARMUP_ON_STARTUP", "false").lower() in {
 RAG_MAX_CONCURRENT_QUERIES = max(1, int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "1")))
 RAG_MAX_CONCURRENT_INGESTIONS = max(1, int(os.getenv("RAG_MAX_CONCURRENT_INGESTIONS", "1")))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+RAG_QUERY_CLARIFICATION_ENABLED = os.getenv("RAG_QUERY_CLARIFICATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 _QUERY_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_QUERIES)
 _INGEST_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_INGESTIONS)
 
@@ -694,6 +704,201 @@ def _bounded_endpoint(semaphore: BoundedSemaphore, operation: str):
         return wrapped
     return decorator
 
+
+_GREETING_RE = re.compile(
+    r"^(?:hi|hello|hey|thanks|thank you|thx|good morning|good evening|good night)[!. ]*$",
+    re.IGNORECASE,
+)
+_VAGUE_STANDALONE_RE = re.compile(
+    r"^(?:explain|describe|tell me about|what about|more about|tell me more|"
+    r"explain this|explain that|what is this|what is that|what about it|"
+    r"and then|why is that|how about this|what do you mean|which one|"
+    r"that one|this one|ye kya|iska kya|iske baare mein|aur batao|"
+    r"uske baare mein|explain it|describe it)[?.! ]*$",
+    re.IGNORECASE,
+)
+_REFERENTIAL_RE = re.compile(
+    r"\b(?:it|its|this|that|these|those|they|them|their|above|previous|same|"
+    r"iska|iske|uska|uske|ye|woh|wo)\b",
+    re.IGNORECASE,
+)
+_AFFIRMATIVE_ONLY_RE = re.compile(
+    r"^(?:yes|yeah|yep|yup|ok|okay|correct|right|haan|han|ha|bilkul|sure|exactly)[!. ]*$",
+    re.IGNORECASE,
+)
+
+
+def _history_as_dicts(history: List[ConversationTurn]) -> List[Dict[str, Any]]:
+    normalized = []
+    for turn in history or []:
+        if hasattr(turn, "model_dump"):
+            normalized.append(turn.model_dump())
+        elif hasattr(turn, "dict"):
+            normalized.append(turn.dict())
+        elif isinstance(turn, dict):
+            normalized.append(turn)
+    return normalized[-8:]
+
+
+def _pending_clarification_query(question: str, history: List[Dict[str, Any]]) -> Optional[str]:
+    """Turn a clarification reply into a standalone query without losing the original intent."""
+    if not history or history[-1].get("role") != "assistant" or not history[-1].get("clarification_needed"):
+        return None
+    original = next(
+        (
+            str(turn.get("content", "")).strip()
+            for turn in reversed(history[:-1])
+            if turn.get("role") == "user" and str(turn.get("content", "")).strip()
+        ),
+        None,
+    )
+    if not original:
+        return None
+    return f"Original request: {original}\nUser clarification: {question.strip()}"
+
+
+def _needs_clarity_preflight(question: str, history: List[Dict[str, Any]]) -> bool:
+    """Keep extra inference limited to short, referential, or suspiciously garbled input."""
+    normalized = re.sub(r"\s+", " ", (question or "").strip())
+    if not normalized or _GREETING_RE.fullmatch(normalized):
+        return False
+    words = re.findall(r"[\w'-]+", normalized, flags=re.UNICODE)
+    if len(words) <= 8 or _REFERENTIAL_RE.search(normalized):
+        return True
+    # Detect obvious keyboard smash / unreadable text without treating normal Hinglish as gibberish.
+    alpha_words = [word for word in words if word.isalpha() and len(word) >= 5]
+    if len(alpha_words) >= 3:
+        low_vowel = sum(1 for word in alpha_words if not re.search(r"[aeiou]", word, re.IGNORECASE))
+        if low_vowel / len(alpha_words) >= 0.65:
+            return True
+    punctuation_ratio = sum(not (char.isalnum() or char.isspace()) for char in normalized) / max(1, len(normalized))
+    return punctuation_ratio > 0.25
+
+
+def _obvious_clarification(question: str, history: List[Dict[str, Any]]) -> Optional[str]:
+    normalized = re.sub(r"\s+", " ", (question or "").strip())
+    if not normalized or _GREETING_RE.fullmatch(normalized):
+        return None
+    if history and history[-1].get("role") == "assistant" and history[-1].get("clarification_needed"):
+        if _AFFIRMATIVE_ONLY_RE.fullmatch(normalized):
+            return (
+                "I still need the specific option or topic. Could you name it in a few words, "
+                "rather than replying only “yes”?"
+            )
+    if not history and _VAGUE_STANDALONE_RE.fullmatch(normalized):
+        return (
+            "I’m not sure what you’re referring to yet. Could you share the topic or paste "
+            "the sentence/document section you mean?"
+        )
+    words = re.findall(r"[\w'-]+", normalized, flags=re.UNICODE)
+    if len(words) == 1:
+        return (
+            f"What would you like to know about “{normalized}”? "
+            "For example, do you want an explanation, a summary, or an answer from an uploaded document?"
+        )
+    if not history and len(words) <= 2 and _REFERENTIAL_RE.search(normalized):
+        return f"Could you clarify what “{normalized}” refers to?"
+    return None
+
+
+def _classify_query_clarity(question: str, history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Classify likely-unclear queries and normalize obvious typos before retrieval."""
+    try:
+        import httpx
+
+        history_lines = []
+        for turn in history[-6:]:
+            role = "Assistant" if turn.get("role") == "assistant" else "User"
+            content = re.sub(r"\s+", " ", str(turn.get("content", ""))).strip()[:500]
+            if content:
+                history_lines.append(f"{role}: {content}")
+        history_text = "\n".join(history_lines) if history_lines else "(no prior conversation)"
+        prompt = (
+            "You are a query clarification and normalization step for a document-grounded RAG assistant. "
+            "Do NOT answer the user's request. Return only valid JSON with keys action, normalized_query, "
+            "clarification_question. Use this shape when clear: "
+            '{"action":"answer","normalized_query":"standalone corrected query","clarification_question":null}. '
+            "Use this shape when unclear: "
+            '{"action":"clarify","normalized_query":null,"clarification_question":"one concise follow-up question"}.\n'
+            "Rules: silently fix obvious typos when the intended question is clear. Do not ask about harmless spelling "
+            "mistakes. Ask one specific follow-up only if the intent is materially ambiguous, the text is garbled/unreadable, "
+            "or a necessary detail is missing. Use recent history to resolve pronouns such as it/this/that; if history "
+            "does not resolve them, ask what they refer to. Do not infer missing facts or invent document contents. "
+            "Reply in the same language (Hindi/Hinglish/English) as the user.\n\n"
+            f"Recent conversation:\n{history_text}\n\nCurrent query:\n{question}\n\nJSON:"
+        )
+        response = httpx.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+                "think": False,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+                "options": {
+                    "num_ctx": min(2048, OLLAMA_NUM_CTX),
+                    "num_predict": 120,
+                    "temperature": 0.0,
+                    "top_p": 0.7,
+                },
+            },
+            timeout=min(25.0, OLLAMA_TIMEOUT_SECONDS),
+        )
+        if response.status_code != 200:
+            logger.warning("Query clarification model returned HTTP %s", response.status_code)
+            return None
+        value = json.loads(response.json().get("response", ""))
+        if value.get("action") == "clarify":
+            clarification = value.get("clarification_question")
+            if not isinstance(clarification, str) or not clarification.strip():
+                return None
+            return {
+                "action": "clarify",
+                "normalized_query": None,
+                "clarification_question": clarification.strip()[:500],
+            }
+        if value.get("action") != "answer":
+            return None
+        normalized_query = value.get("normalized_query")
+        if not isinstance(normalized_query, str) or not normalized_query.strip():
+            normalized_query = question
+        return {
+            "action": "answer",
+            "normalized_query": normalized_query.strip()[:4000],
+            "clarification_question": None,
+        }
+    except Exception:
+        logger.warning("Query clarification classifier failed; using original query", exc_info=True)
+        return None
+
+
+def understand_query(question: str, conversation_history: List[ConversationTurn]) -> Dict[str, Any]:
+    """Return normalized text or a clarification question before database retrieval."""
+    history = _history_as_dicts(conversation_history)
+    pending = _pending_clarification_query(question, history)
+    if pending:
+        # Re-evaluate the combined intent so a plain "yes" doesn't guess which option was meant.
+        if RAG_QUERY_CLARIFICATION_ENABLED:
+            classified = _classify_query_clarity(pending, history)
+            if classified:
+                return classified
+        return {"action": "answer", "normalized_query": pending, "clarification_question": None}
+
+    direct = _obvious_clarification(question, history)
+    if direct:
+        return {"action": "clarify", "normalized_query": None, "clarification_question": direct}
+
+    if not RAG_QUERY_CLARIFICATION_ENABLED or not _needs_clarity_preflight(question, history):
+        return {"action": "answer", "normalized_query": question.strip(), "clarification_question": None}
+
+    classified = _classify_query_clarity(question, history)
+    if classified:
+        return classified
+    # If Ollama is unreachable, don't block every short query; only deterministic obvious cases clarify.
+    return {"action": "answer", "normalized_query": question.strip(), "clarification_question": None}
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 def _ollama_model_available(models: Any, configured_model: str) -> bool:
@@ -928,13 +1133,24 @@ def delete_document_chunks(
 def query_ai(req: QueryRequest):
     """Answer a user question using RAG + User Identity & Role Awareness with STRICT privacy boundaries"""
     try:
+        # Clarify/normalize before profile lookup, embeddings, DB retrieval, or generation.
+        understanding = understand_query(req.question, req.conversation_history)
+        if understanding["action"] == "clarify":
+            return QueryResponse(
+                answer=understanding["clarification_question"],
+                sources=[],
+                chunks_used=0,
+                clarification_needed=True,
+            )
+        effective_question = understanding["normalized_query"] or req.question
+
         user_profile = fetch_user_profile(req.user_id, req.user_profile)
-        is_self = is_self_referential_query(req.question, user_profile)
+        is_self = is_self_referential_query(effective_question, user_profile)
         scope = req.scope or "College + Personal"
-        logger.info(f"Query: '{req.question[:80]}' | User: {user_profile['name']} ({user_profile['role']}) | Scope: {scope} | Self-ref: {is_self}")
+        logger.info(f"Query: '{effective_question[:80]}' | User: {user_profile['name']} ({user_profile['role']}) | Scope: {scope} | Self-ref: {is_self}")
 
         # Fast direct answer for simple identity/role questions
-        q_clean = req.question.strip().lower()
+        q_clean = effective_question.strip().lower()
         first_name = user_profile['name'].split()[0] if user_profile.get('name') else 'Student'
 
         if re.search(r'\b(mera role|my role|kya role|meri role)\b', q_clean):
@@ -989,7 +1205,7 @@ def query_ai(req: QueryRequest):
 
         # 1. Embed question
         try:
-            question_embedding = get_embedding(req.question, is_query=True)
+            question_embedding = get_embedding(effective_question, is_query=True)
         except Exception as e:
             logger.exception("Query embedding failed")
             raise HTTPException(status_code=503, detail="Embedding model unavailable or misconfigured.") from e
@@ -997,7 +1213,7 @@ def query_ai(req: QueryRequest):
         # 2. Retrieve authorized candidates with hybrid dense + lexical RRF ranking.
         requested_k = max(1, min(int(req.top_k or 5), 8))
         context_items = retrieve_context(
-            req.question, question_embedding, req.user_id, scope, requested_k,
+            effective_question, question_embedding, req.user_id, scope, requested_k,
             is_self=is_self, user_profile=user_profile
         )
         context_items = select_context_items(context_items)
@@ -1008,7 +1224,7 @@ def query_ai(req: QueryRequest):
                 sources.append(filename)
 
         # 3. Generate grounded answer with Advanced Prompt Engineering
-        answer = generate_answer(req.question, context_items, user_profile, is_self)
+        answer = generate_answer(effective_question, context_items, user_profile, is_self)
 
         return QueryResponse(
             answer=answer,
