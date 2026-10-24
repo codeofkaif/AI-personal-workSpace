@@ -48,14 +48,13 @@ public class DocumentService {
             .build();
         doc = documentRepository.save(doc);
 
-        // 3. Ingest into RAG (FastAPI) — send the original MultipartFile
+        // 3. The upload is not complete until RAG confirms that searchable chunks exist.
         int chunks = aiClientService.ingestDocument(file, user.getId(), doc.getId());
-        if (chunks < 0) {
-            log.warn("RAG ingest failed for doc id={}, proceeding without vector index.", doc.getId());
-        } else {
-            log.info("RAG ingested {} chunks for doc id={}", chunks, doc.getId());
+        if (chunks <= 0) {
+            rollbackFailedUpload(doc, filePath, user.getId());
+            throw indexingFailure(file.getOriginalFilename(), chunks);
         }
-
+        log.info("RAG ingested {} chunks for doc id={}", chunks, doc.getId());
         return toResponse(doc);
     }
 
@@ -82,10 +81,13 @@ public class DocumentService {
             .build();
         doc = documentRepository.save(doc);
 
-        // 3. Ingest into RAG
+        // 3. The upload is not complete until RAG confirms that searchable chunks exist.
         int chunks = aiClientService.ingestDocument(file, admin.getId(), doc.getId());
+        if (chunks <= 0) {
+            rollbackFailedUpload(doc, filePath, admin.getId());
+            throw indexingFailure(file.getOriginalFilename(), chunks);
+        }
         log.info("College doc ingested: {} chunks for doc id={}", chunks, doc.getId());
-
         return toResponse(doc);
     }
 
@@ -113,6 +115,47 @@ public class DocumentService {
             );
         }
         documentRepository.delete(doc);
+    }
+
+    /**
+     * Avoid leaving a document in the UI/database as searchable when indexing failed.
+     * Chunk deletion is attempted before the document row is removed; if the RAG service
+     * is unreachable, orphaned chunks are logged for subsequent maintenance and are not
+     * retrievable because their owning document row is gone.
+     */
+    private void rollbackFailedUpload(Document doc, Path filePath, Long userId) {
+        if (doc != null && doc.getId() != null) {
+            boolean indexPurged = aiClientService.deleteDocumentChunks(doc.getId(), userId);
+            if (!indexPurged) {
+                log.error(
+                    "RAG cleanup was not confirmed for failed upload doc id={}; remove any orphaned chunks during maintenance.",
+                    doc.getId()
+                );
+            }
+            try {
+                documentRepository.delete(doc);
+            } catch (RuntimeException ex) {
+                log.error("Could not remove failed upload database record id={}", doc.getId(), ex);
+            }
+        }
+        try {
+            Files.deleteIfExists(filePath);
+        } catch (IOException ex) {
+            log.warn("Could not remove failed upload file {}", filePath, ex);
+        }
+    }
+
+    private IllegalStateException indexingFailure(String filename, int chunks) {
+        if (chunks == 0) {
+            return new IllegalStateException(
+                "Upload rejected: no searchable text chunks were produced for '" + filename
+                    + "'. For scanned PDFs, install Tesseract OCR and verify its language packs, then upload again."
+            );
+        }
+        return new IllegalStateException(
+            "Upload failed: the RAG service did not confirm document indexing for '" + filename
+                + "'. Check RAG health, the shared RAG_API_KEY, and service logs, then retry."
+        );
     }
 
     private DocumentResponse toResponse(Document d) {
