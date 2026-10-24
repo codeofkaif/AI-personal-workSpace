@@ -108,24 +108,66 @@ public class DocumentService {
     }
 
     private DocumentResponse requireIndexed(MultipartFile file, User owner, Document doc, Path filePath) {
-        int chunks = aiClientService.ingestDocument(file, owner.getId(), doc.getId());
-        if (chunks > 0) {
-            log.info("RAG indexed {} chunks for document id={}", chunks, doc.getId());
+        AIClientService.IngestionResult ingestion =
+            aiClientService.ingestDocumentResult(file, owner.getId(), doc.getId());
+
+        if (ingestion.indexed()) {
+            log.info("RAG indexed {} chunks for document id={}", ingestion.chunksCreated(), doc.getId());
             return toResponse(doc);
         }
 
-        cleanupFailedUpload(doc, filePath);
-        String detail = chunks == 0
-            ? "No readable text could be indexed. This is usually a scanned/image-only PDF; install OCR or upload a text-based PDF, DOCX, TXT, or MD file."
-            : "The RAG indexing service is unavailable. The document was not saved; retry after RAG is healthy.";
-        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, detail);
+        // The RAG delete endpoint verifies ownership against the document row, so purge first.
+        cleanupFailedUpload(doc, filePath, owner.getId());
+
+        int upstreamStatus = ingestion.httpStatus();
+        HttpStatus publicStatus = mapIngestionFailureStatus(upstreamStatus);
+        String detail = ingestion.message();
+        if (detail == null || detail.isBlank()) {
+            detail = upstreamStatus == HttpStatus.UNPROCESSABLE_ENTITY.value()
+                ? "No searchable text chunks were produced. Scanned PDFs may require Tesseract OCR."
+                : "The RAG service did not confirm indexing. Check RAG health and retry.";
+        }
+        if (upstreamStatus == HttpStatus.UNAUTHORIZED.value()
+                || upstreamStatus == HttpStatus.FORBIDDEN.value()) {
+            detail += " This is a backend-to-RAG authentication failure; ensure RAG_API_KEY matches in the root .env for both services.";
+        }
+
+        throw new ResponseStatusException(
+            publicStatus,
+            "Document '" + file.getOriginalFilename() + "' was not indexed: " + detail
+        );
     }
 
-    private void cleanupFailedUpload(Document doc, Path filePath) {
-        try {
-            documentRepository.deleteById(doc.getId());
-        } catch (RuntimeException e) {
-            log.error("Could not remove unindexed document record id={}", doc.getId(), e);
+    private HttpStatus mapIngestionFailureStatus(int upstreamStatus) {
+        if (upstreamStatus == HttpStatus.UNPROCESSABLE_ENTITY.value()) {
+            return HttpStatus.UNPROCESSABLE_ENTITY;
+        }
+        if (upstreamStatus == HttpStatus.PAYLOAD_TOO_LARGE.value()) {
+            return HttpStatus.PAYLOAD_TOO_LARGE;
+        }
+        if (upstreamStatus == HttpStatus.UNSUPPORTED_MEDIA_TYPE.value()) {
+            return HttpStatus.UNSUPPORTED_MEDIA_TYPE;
+        }
+        if (upstreamStatus == HttpStatus.TOO_MANY_REQUESTS.value()) {
+            return HttpStatus.TOO_MANY_REQUESTS;
+        }
+        // Internal service-to-service 401/403 should not be mistaken for user auth failure.
+        return HttpStatus.SERVICE_UNAVAILABLE;
+    }
+
+    private void cleanupFailedUpload(Document doc, Path filePath, Long userId) {
+        if (doc != null && doc.getId() != null) {
+            if (!aiClientService.deleteDocumentChunks(doc.getId(), userId)) {
+                log.error(
+                    "Could not confirm RAG chunk cleanup for failed upload document id={}; maintenance may need to remove orphaned chunks.",
+                    doc.getId()
+                );
+            }
+            try {
+                documentRepository.deleteById(doc.getId());
+            } catch (RuntimeException e) {
+                log.error("Could not remove unindexed document record id={}", doc.getId(), e);
+            }
         }
         try {
             Files.deleteIfExists(filePath);

@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="AI Personal Workspace — RAG Service",
     description="FastAPI service for document ingestion, embeddings, and role-aware AI Q&A",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -103,6 +103,7 @@ OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120
 RAG_WARMUP_ON_STARTUP = os.getenv("RAG_WARMUP_ON_STARTUP", "false").lower() in {"1", "true", "yes"}
 RAG_MAX_CONCURRENT_QUERIES = max(1, int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "1")))
 RAG_MAX_CONCURRENT_INGESTIONS = max(1, int(os.getenv("RAG_MAX_CONCURRENT_INGESTIONS", "1")))
+OCR_ENABLED = os.getenv("OCR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 _QUERY_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_QUERIES)
 _INGEST_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_INGESTIONS)
 
@@ -695,9 +696,25 @@ def _bounded_endpoint(semaphore: BoundedSemaphore, operation: str):
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+def _ollama_model_available(models: Any, configured_model: str) -> bool:
+    """Only report the generation dependency ready if the exact configured model tag exists."""
+    expected = (configured_model or "").strip()
+    if not expected or not isinstance(models, list):
+        return False
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or "").strip()
+        if name == expected:
+            return True
+        if ":" not in expected and name == f"{expected}:latest":
+            return True
+    return False
+
+
 @app.get("/health")
 def health_check():
-    """Report dependency readiness without forcing large embedding/reranker models to load."""
+    """Report database, exact generation-model, and optional OCR capability."""
     database_ok = False
     conn = get_db_connection()
     if conn is not None:
@@ -710,25 +727,49 @@ def health_check():
         finally:
             conn.close()
 
-    ollama_ok = False
+    ollama_api_ok = False
+    configured_model_ok = False
     try:
         import httpx
         response = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2.0)
-        ollama_ok = response.status_code == 200
+        ollama_api_ok = response.status_code == 200
+        if ollama_api_ok:
+            configured_model_ok = _ollama_model_available(response.json().get("models", []), OLLAMA_MODEL)
     except Exception:
-        ollama_ok = False
+        logger.exception("Ollama/model readiness check failed")
 
-    status = "healthy" if database_ok and ollama_ok else "degraded"
+    tesseract_available = bool(shutil.which("tesseract")) if OCR_ENABLED else None
+    warnings = []
+    if not ollama_api_ok:
+        warnings.append("Ollama API is unavailable.")
+    elif not configured_model_ok:
+        warnings.append(
+            f"Configured Ollama model '{OLLAMA_MODEL}' is not installed; run 'ollama pull {OLLAMA_MODEL}'."
+        )
+    if OCR_ENABLED and not tesseract_available:
+        warnings.append(
+            "OCR is enabled but Tesseract is not installed; scanned/image-only PDFs will not be searchable."
+        )
+
+    # Missing OCR affects scanned files only; digital text files can still use RAG.
+    ready = database_ok and ollama_api_ok and configured_model_ok
     return {
-        "status": status,
+        "status": "healthy" if ready else "degraded",
         "service": "RAG Service",
-        "version": "1.2.0",
-        "checks": {"database": "up" if database_ok else "down", "ollama": "up" if ollama_ok else "down"},
+        "version": "1.3.0",
+        "checks": {
+            "database": "up" if database_ok else "down",
+            "ollama": "up" if ollama_api_ok else "down",
+            "ollama_model": "available" if configured_model_ok else ("missing" if ollama_api_ok else "unknown"),
+            "ocr": "available" if tesseract_available is True else ("missing" if OCR_ENABLED else "disabled"),
+        },
+        "configured_ollama_model": OLLAMA_MODEL,
         "embedding_model": EMBEDDING_MODEL_NAME,
         "embedding_dimension": EMBEDDING_DIMENSION,
         "embedding_loaded": _embedding_model is not None,
         "reranking_enabled": RERANK_ENABLED,
         "reranker_loaded": _RERANKER is not None,
+        "warnings": warnings,
     }
 
 @app.post("/ingest", response_model=IngestResponse)
@@ -758,18 +799,29 @@ def ingest_document(
         page_texts = extract_pages_from_file(file_bytes, filename)
         page_texts = [(page, text) for page, text in page_texts if text.strip()]
         if not page_texts:
-            return IngestResponse(
-                success=False,
-                message=f"No readable text could be extracted from '{filename}'. Scanned PDFs may require OCR.",
-                chunks_created=0
+            message = (
+                f"No readable text could be extracted from '{filename}'. "
+                "The document was not indexed and must not be treated as searchable."
             )
+            if suffix == ".pdf" and OCR_ENABLED and not shutil.which("tesseract"):
+                message += (
+                    " OCR is enabled but Tesseract is missing. On macOS run 'brew install tesseract', "
+                    "verify the required language with 'tesseract --list-langs', restart the RAG service, "
+                    "and upload the file again."
+                )
+            elif suffix == ".pdf":
+                message += " If this is a scanned PDF, verify Tesseract and the required OCR language packs."
+            raise HTTPException(status_code=422, detail=message)
         chunk_records = [
             (page_number, chunk)
             for page_number, page_text in page_texts
             for chunk in chunk_text(page_text)
         ]
         if not chunk_records:
-            return IngestResponse(success=False, message="No non-empty chunks were produced.", chunks_created=0)
+            raise HTTPException(
+                status_code=422,
+                detail=f"No non-empty text chunks could be produced for '{filename}'; the document was not indexed."
+            )
 
         clean_chunks = [chunk.replace("\x00", "").strip() for _, chunk in chunk_records]
         embeddings = get_embeddings(clean_chunks)
@@ -991,7 +1043,7 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
         }
         # Explicitly control thinking mode for reasoning models (Qwen, DeepSeek, etc.)
         think_enabled = (
-            os.getenv("OLLAMA_THINK", "false").strip().lower()
+            os.getenv("OLLAMA_THINK", "true").strip().lower()
             in {"1", "true", "yes", "on"}
         )
         if OLLAMA_MODEL.lower().startswith(("qwen", "deepseek")):
@@ -1014,8 +1066,11 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
             )
             raw_response = result.get("response", "").strip()
             if not raw_response and result.get("thinking"):
-                raw_response = result.get("thinking", "").strip()
-            return raw_response
+                logger.warning(
+                    "Ollama returned thinking output but no final response for model=%s; refusing to expose thinking as the answer.",
+                    OLLAMA_MODEL,
+                )
+            return raw_response or None
         logger.warning("Ollama returned status=%s after %.1f ms", resp.status_code, elapsed_ms)
     except Exception as e:
         logger.warning(f"Ollama call failed: {e}")
