@@ -225,42 +225,46 @@ def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
     words = set(re.findall(r"\b\w+\b", q_lower))
     return bool(words & self_words)
 
-def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
-    """Extract text content from uploaded file, stripping null bytes for PostgreSQL compatibility"""
+def extract_pages_from_file(file_bytes: bytes, filename: str) -> List[tuple[int, str]]:
+    """Extract text with PDF page provenance; non-paginated formats use page 0."""
+    lower_name = (filename or "").lower()
     try:
-        lower_name = filename.lower()
-        if lower_name.endswith('.pdf'):
+        if lower_name.endswith(".pdf"):
+            import io
             try:
                 import pypdf
-                import io
                 reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-                text = "\n".join(page.extract_text() or "" for page in reader.pages)
-                return text.replace('\x00', '')
             except Exception:
-                try:
-                    import PyPDF2
-                    import io
-                    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-                    text = "\n".join(page.extract_text() or "" for page in reader.pages)
-                    return text.replace('\x00', '')
-                except Exception as ep:
-                    logger.error(f"PDF extraction error: {ep}")
-                    return ""
-        elif lower_name.endswith('.docx') or lower_name.endswith('.doc'):
-            try:
-                import docx
-                import io
-                doc = docx.Document(io.BytesIO(file_bytes))
-                text = "\n".join(p.text for p in doc.paragraphs if p.text)
-                return text.replace('\x00', '')
-            except Exception as ed:
-                logger.error(f"DOCX extraction error: {ed}")
-                return ""
-        else:
-            return file_bytes.decode('utf-8', errors='ignore').replace('\x00', '')
+                import PyPDF2
+                reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            return [
+                (index + 1, (page.extract_text() or "").replace("\x00", "").strip())
+                for index, page in enumerate(reader.pages)
+            ]
+        if lower_name.endswith(".docx"):
+            import io
+            import docx
+            document = docx.Document(io.BytesIO(file_bytes))
+            text = "\n\n".join(paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip())
+            # Preserve table text rather than silently dropping it.
+            for table in document.tables:
+                rows = []
+                for row in table.rows:
+                    rows.append(" | ".join(cell.text.strip() for cell in row.cells))
+                if rows:
+                    text += "\n\n" + "\n".join(rows)
+            return [(0, text.replace("\x00", "").strip())] if text.strip() else []
+        if lower_name.endswith(".doc"):
+            raise ValueError("Legacy .doc is not supported; convert it to .docx first.")
+        text = file_bytes.decode("utf-8", errors="ignore").replace("\x00", "").strip()
+        return [(0, text)] if text else []
     except Exception as e:
-        logger.error(f"Text extraction error: {e}")
-        return ""
+        logger.warning("Text extraction failed for %s: %s", filename, e)
+        return []
+
+def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
+    """Compatibility wrapper for callers that only need the extracted text."""
+    return "\n\n".join(text for _, text in extract_pages_from_file(file_bytes, filename) if text)
 
 def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[int] = None) -> List[str]:
     """Paragraph-aware chunks bounded with the embedding tokenizer when available."""
