@@ -230,7 +230,7 @@ cp .env.example .env
 
 ### Important: re-index old documents once
 
-The embedding model and chunking strategy changed. Old vectors must not be mixed with new vectors. Existing records are marked with the legacy model; the retrieval path only searches vectors whose recorded model matches the configured model. Before testing college-only queries, backfill legacy shared-document scope metadata with: `psql -d ai_workspace -f docs/migrations/fix_college_document_scope.sql`. Review the affected rows first, especially in databases with multiple colleges.
+The embedding model and chunking strategy changed. Old vectors must not be mixed with new vectors. Existing records are marked with the legacy model; the retrieval path only searches vectors whose recorded model matches the configured model. Before testing college-only queries, inspect legacy shared-document scope metadata with `psql -d ai_workspace -c "SELECT d.id, d.title, u.college_id FROM documents d JOIN users u ON u.id = d.user_id WHERE d.is_college_doc IS TRUE AND d.college_id IS NULL;"`. If the result is correct, apply `psql -d ai_workspace -f docs/migrations/fix_college_document_scope.sql`. Documents whose uploader has no college association remain excluded until that ownership metadata is fixed.
 
 1. Confirm your uploaded files still exist under backend/uploads.
 2. Set EMBEDDING_MODEL_NAME=intfloat/multilingual-e5-small and LEGACY_EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2 in .env.
