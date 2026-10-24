@@ -234,27 +234,39 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
     return profile
 
 def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
-    """Detect self-reference without substring matches such as me inside semester."""
+    """Detect genuine self-profile questions without matching common English filler words."""
     q_lower = q.lower()
-    name = (profile.get("name") or "").lower()
+    name = (profile.get("name") or "").strip().lower()
     first_name = name.split()[0] if name else ""
 
-    self_words = {"me", "mera", "meri", "mere", "mai", "main", "my", "mine", "myself", "apne", "apna", "apni"}
+    # Do not treat common phrases like "tell me..." or "main method" as personal-profile requests.
     self_phrases = (
-        "who am i", "who i am", "about me", "my profile", "mera profile", "meri profile",
-        "my role", "mera role", "meri role", "my resume", "mera resume", "meri resume",
-        "my placement", "mera placement", "meri placement", "my score", "mera score",
-        "mere bare", "mere baare", "mere baare mein", "my cgpa", "mera cgpa",
-        "my scholarship", "meri scholarship", "my fees", "meri fees"
+        "who am i", "who i am", "about me", "about myself", "what do you know about me",
+        "my profile", "mera profile", "meri profile", "my role", "mera role", "meri role",
+        "my resume", "mera resume", "meri resume", "my placement", "mera placement", "meri placement",
+        "my score", "mera score", "mere bare", "mere baare", "mere baare mein",
+        "my cgpa", "mera cgpa", "my scholarship", "meri scholarship",
+        "my fees", "meri fees", "my timetable", "mera timetable", "meri timetable",
+        "my name", "mera naam", "meri details", "my details",
+        "main kaun hu", "mai kaun hu", "main kaun hoon", "mai kaun hoon",
+        "main kya hu", "mai kya hu", "mera kya status", "meri kya status"
     )
-    if name and re.search(r"\b" + re.escape(name) + r"\b", q_lower):
+    if name and re.search(r"\\b" + re.escape(name) + r"\\b", q_lower):
         return True
-    if first_name and len(first_name) > 2 and re.search(r"\b" + re.escape(first_name) + r"\b", q_lower):
+    if first_name and len(first_name) > 2 and re.search(r"\\b" + re.escape(first_name) + r"\\b", q_lower):
         return True
     if any(phrase in q_lower for phrase in self_phrases):
         return True
-    words = set(re.findall(r"\b\w+\b", q_lower))
-    return bool(words & self_words)
+
+    words = set(re.findall(r"\\b\\w+\\b", q_lower))
+    if words & {"mera", "meri", "mere", "apne", "apna", "apni"}:
+        return True
+    # English "my" is only a signal when paired with an actual profile field.
+    profile_fields = {
+        "profile", "role", "resume", "placement", "score", "cgpa", "scholarship",
+        "fees", "timetable", "attendance", "roll", "department", "marks", "name"
+    }
+    return "my" in words and bool(words & profile_fields)
 
 def _ocr_pdf_page(file_bytes: bytes, page_index: int) -> str:
     """Optional local OCR fallback. Requires PyMuPDF and the system Tesseract binary."""
