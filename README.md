@@ -203,11 +203,18 @@ Open `http://localhost:5173` in your browser.
 
 ## 🔑 Environment Variables
 
-Copy .env.example to create one local configuration file used by the frontend and both service starter scripts:
+Copy the example to the repository-root `.env` before starting services, then replace the development placeholders with your local database credentials and strong random secrets:
 
 ```bash
 cp .env.example .env
 ```
+
+Important settings:
+- `RAG_API_KEY` must be the same in Spring Boot and FastAPI. Do not commit your real `.env` or paste the secret into source code.
+- `RAG_QUERY_CLARIFICATION_ENABLED=true` enables the pre-retrieval query clarification step. Set it to `false` to remove that extra model call.
+- `RAG_RELOAD=false` is the stable default; enable reload only while actively editing the Python service.
+- `OCR_ENABLED=true` enables OCR support, but scanned PDFs require the Tesseract executable and the relevant language packs.
+- `OLLAMA_MODEL` must match a model installed locally in Ollama. The example uses `qwen3.5:9b-q4_K_M`; pull that exact tag, or change the value to a model you already have.
 
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
@@ -224,7 +231,7 @@ cp .env.example .env
 - **Chunking:** paragraph-aware token chunks, configurable with CHUNK_SIZE_TOKENS (default 350) and CHUNK_OVERLAP_TOKENS (default 50). PDF page numbers are retained. Context assembly deduplicates chunks and obeys RAG_CONTEXT_TOKEN_BUDGET (default 1800) and RAG_CONTEXT_CHUNKS (default 4).
 - **Retrieval:** dense pgvector search and PostgreSQL full-text search, fused using Reciprocal Rank Fusion. Concurrent query and ingestion limits prevent local inference work from growing without bounds.
 - **Reranking:** optional local cross-encoder, configured with RERANK_ENABLED and RERANKER_MODEL_NAME. The configured multilingual MS MARCO cross-encoder was trained using translated ranking data; verify performance on this project's own Hindi/Hinglish and English test set. See [its model card](https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1).
-- **Generation:** Ollama with qwen3:4b-instruct-2507-q4_K_M, temperature=0.1, num_ctx=4096, bounded output tokens, and a keep-warm interval. These are starting defaults; benchmark your actual hardware and questions before changing them. Set RAG_WARMUP_ON_STARTUP=true to load embedding/reranker/LLM models before serving requests and reduce first-query latency (at the cost of slower startup).
+- **Generation:** Ollama with the model selected by `OLLAMA_MODEL` (the safe example uses `qwen3.5:9b-q4_K_M`), temperature=0.1, num_ctx=4096, bounded output tokens, and a keep-warm interval. These are starting defaults; benchmark your actual hardware and questions before changing them. Set `RAG_WARMUP_ON_STARTUP=true` to load embedding/reranker/LLM models before serving requests and reduce first-query latency (at the cost of slower startup).
 - **Evidence handling:** invalid source labels cause excerpt fallback; if no source label is emitted, the service appends the actual retrieved source labels. This is source-label validation, not a guarantee that every natural-language claim is entailed by the source.
 - **Safety:** RAG endpoints support a shared X-RAG-API-Key. Production mode refuses protected query/ingestion calls if RAG_ENV=production but RAG_API_KEY is missing. FastAPI binds to 127.0.0.1 by default and development reload is disabled when RAG_ENV=production. Only set RAG_HOST=0.0.0.0 if external devices genuinely need access, and then enforce a shared secret, firewall rules, and appropriate CORS origins. Configure the same key in Spring Boot.
 
