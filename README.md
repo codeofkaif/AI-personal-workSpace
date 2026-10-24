@@ -237,6 +237,9 @@ The embedding model and chunking strategy changed. Old vectors must not be mixed
 3. Preview re-indexing first:
 
    \`\`\`bash
+   set -a
+   source .env
+   set +a
    python rag-service/reindex_documents.py --dry-run
    \`\`\`
 
@@ -264,6 +267,9 @@ python -m py_compile main.py reindex_documents.py evaluate_retrieval.py
 Build a manually verified JSONL dataset using real user IDs and relevant chunk IDs, then run:
 
 \`\`\`bash
+set -a
+source .env
+set +a
 python rag-service/evaluate_retrieval.py rag-service/evaluation/questions.jsonl --output rag-service/evaluation/latest-report.json
 \`\`\`
 
