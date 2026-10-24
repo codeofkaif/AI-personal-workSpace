@@ -133,6 +133,7 @@ def get_embedding(text: str, is_query: bool = False) -> List[float]:
 # ── DB Connection ─────────────────────────────────────────────────────────────
 
 def get_db_connection():
+    conn = None
     try:
         import psycopg2
         conn = psycopg2.connect(
@@ -140,7 +141,9 @@ def get_db_connection():
             port=int(os.getenv("DB_PORT", "5432")),
             database=os.getenv("DB_NAME", "ai_workspace"),
             user=os.getenv("DB_USER", "kaifkhan"),
-            password=os.getenv("DB_PASSWORD", "")
+            password=os.getenv("DB_PASSWORD", ""),
+            connect_timeout=max(1, int(os.getenv("DB_CONNECT_TIMEOUT_SEC", "5"))),
+            application_name="ai-personal-workspace-rag",
         )
         from pgvector.psycopg2 import register_vector
         try:
@@ -153,7 +156,12 @@ def get_db_connection():
             register_vector(conn)
         return conn
     except Exception as e:
-        logger.error(f"DB connection failed: {e}")
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.error("DB connection failed: %s", e)
         return None
 
 def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
