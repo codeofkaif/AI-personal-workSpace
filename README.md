@@ -226,11 +226,11 @@ cp .env.example .env
 - **Reranking:** optional local cross-encoder, configured with RERANK_ENABLED and RERANKER_MODEL_NAME. The configured multilingual MS MARCO cross-encoder was trained using translated ranking data; verify performance on this project's own Hindi/Hinglish and English test set. See [its model card](https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1).
 - **Generation:** Ollama with qwen3:4b-instruct-2507-q4_K_M, temperature=0.1, num_ctx=4096, bounded output tokens, and a keep-warm interval. These are starting defaults; benchmark your actual hardware and questions before changing them.
 - **Evidence handling:** invalid source labels cause excerpt fallback; if no source label is emitted, the service appends the actual retrieved source labels. This is source-label validation, not a guarantee that every natural-language claim is entailed by the source.
-- **Safety:** RAG endpoints support a shared X-RAG-API-Key. Production mode refuses protected query/ingestion calls if RAG_ENV=production but RAG_API_KEY is missing. Keep FastAPI network access private and configure the same key in Spring Boot.
+- **Safety:** RAG endpoints support a shared X-RAG-API-Key. Production mode refuses protected query/ingestion calls if RAG_ENV=production but RAG_API_KEY is missing. FastAPI binds to 127.0.0.1 by default and development reload is disabled when RAG_ENV=production. Only set RAG_HOST=0.0.0.0 if external devices genuinely need access, and then enforce a shared secret, firewall rules, and appropriate CORS origins. Configure the same key in Spring Boot.
 
 ### Important: re-index old documents once
 
-The embedding model and chunking strategy changed. Old vectors must not be mixed with new vectors. Existing records are marked with the legacy model; the retrieval path only searches vectors whose recorded model matches the configured model.
+The embedding model and chunking strategy changed. Old vectors must not be mixed with new vectors. Existing records are marked with the legacy model; the retrieval path only searches vectors whose recorded model matches the configured model. Before testing college-only queries, backfill legacy shared-document scope metadata with: `psql -d ai_workspace -f docs/migrations/fix_college_document_scope.sql`. Review the affected rows first, especially in databases with multiple colleges.
 
 1. Confirm your uploaded files still exist under backend/uploads.
 2. Set EMBEDDING_MODEL_NAME=intfloat/multilingual-e5-small and LEGACY_EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2 in .env.
