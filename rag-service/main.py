@@ -710,26 +710,31 @@ async def query_ai(req: QueryRequest):
         raise HTTPException(status_code=500, detail="AI query failed due to an internal error.") from e
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "gemma2:2b")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen3:4b-instruct-2507-q4_K_M")
 
 def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[str]:
     """Call local Ollama API with tuned generation parameters"""
     try:
         import httpx
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "options": {
+                "num_ctx": OLLAMA_NUM_CTX,
+                "num_predict": max_tokens,
+                "temperature": OLLAMA_TEMPERATURE,
+                "top_p": OLLAMA_TOP_P,
+                "repeat_penalty": 1.08,
+            }
+        }
+        # Qwen3 supports explicitly disabling its thinking mode for lower latency.
+        if OLLAMA_MODEL.lower().startswith("qwen3"):
+            payload["think"] = False
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-                "options": {
-                    "num_ctx": OLLAMA_NUM_CTX,
-                    "num_predict": max_tokens,
-                    "temperature": OLLAMA_TEMPERATURE,
-                    "top_p": OLLAMA_TOP_P
-                }
-            },
+            json=payload,
             timeout=OLLAMA_TIMEOUT_SECONDS,
         )
         if resp.status_code == 200:
