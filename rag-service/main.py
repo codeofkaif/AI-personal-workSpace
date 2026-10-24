@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+from functools import wraps
 import os
 import json
 import logging
@@ -16,7 +17,7 @@ import re
 import hmac
 import shutil
 import time
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,6 +88,10 @@ RAG_ENV = os.getenv("RAG_ENV", "development").lower()
 OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "350"))))
 OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")))
 RAG_WARMUP_ON_STARTUP = os.getenv("RAG_WARMUP_ON_STARTUP", "false").lower() in {"1", "true", "yes"}
+RAG_MAX_CONCURRENT_QUERIES = max(1, int(os.getenv("RAG_MAX_CONCURRENT_QUERIES", "2")))
+RAG_MAX_CONCURRENT_INGESTIONS = max(1, int(os.getenv("RAG_MAX_CONCURRENT_INGESTIONS", "1")))
+_QUERY_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_QUERIES)
+_INGEST_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_INGESTIONS)
 
 _embedding_model = None
 _embedding_model_lock = Lock()
@@ -558,6 +563,23 @@ async def protect_internal_rag_endpoints(request: Request, call_next):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized RAG service request."})
     return await call_next(request)
 
+def _bounded_endpoint(semaphore: BoundedSemaphore, operation: str):
+    """Reject excess heavy work instead of allowing unbounded inference to exhaust RAM."""
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not semaphore.acquire(blocking=False):
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"RAG {operation} capacity reached; retry shortly."
+                )
+            try:
+                return func(*args, **kwargs)
+            finally:
+                semaphore.release()
+        return wrapped
+    return decorator
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -597,6 +619,7 @@ def health_check():
     }
 
 @app.post("/ingest", response_model=IngestResponse)
+@_bounded_endpoint(_INGEST_SEMAPHORE, "ingestion")
 def ingest_document(
     file: UploadFile = File(...),
     user_id: Optional[int] = Form(None),
@@ -736,6 +759,7 @@ def delete_document_chunks(
         conn.close()
 
 @app.post("/query", response_model=QueryResponse)
+@_bounded_endpoint(_QUERY_SEMAPHORE, "query")
 def query_ai(req: QueryRequest):
     """Answer a user question using RAG + User Identity & Role Awareness with STRICT privacy boundaries"""
     try:
