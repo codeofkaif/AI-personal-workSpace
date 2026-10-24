@@ -60,13 +60,16 @@ def test_college_scope_checks_current_users_college():
     assert params == (42, 42)
 
 
-def test_unknown_citation_falls_back_to_source_excerpt():
+def test_unknown_citation_is_stripped_and_real_source_is_attached():
+    # Citation validation removes fabricated source labels without discarding the
+    # whole model answer, then attaches only a source that was actually retrieved.
     context = [{"filename": "syllabus.pdf", "content": "The exam is in December."}]
     answer = "The exam is in May. [Source: made-up.pdf]"
     result = main._validate_source_citations(answer, context)
     assert "made-up.pdf" not in result
     assert "syllabus.pdf" in result
-    assert "could not be verified" in result
+    assert "could not be verified" not in result
+    assert "**Sources:**" in result
 
 
 def test_missing_citation_adds_actual_source_label():
