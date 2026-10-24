@@ -15,6 +15,7 @@ import logging
 import re
 import hmac
 import shutil
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -545,7 +546,39 @@ async def protect_internal_rag_endpoints(request: Request, call_next):
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "service": "RAG Service", "version": "1.2.0", "embedding_model": EMBEDDING_MODEL_NAME, "embedding_dimension": EMBEDDING_DIMENSION}
+    """Report dependency readiness without forcing large embedding/reranker models to load."""
+    database_ok = False
+    conn = get_db_connection()
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                database_ok = cur.fetchone()[0] == 1
+        except Exception:
+            logger.exception("Database health check failed")
+        finally:
+            conn.close()
+
+    ollama_ok = False
+    try:
+        import httpx
+        response = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2.0)
+        ollama_ok = response.status_code == 200
+    except Exception:
+        ollama_ok = False
+
+    status = "healthy" if database_ok and ollama_ok else "degraded"
+    return {
+        "status": status,
+        "service": "RAG Service",
+        "version": "1.2.0",
+        "checks": {"database": "up" if database_ok else "down", "ollama": "up" if ollama_ok else "down"},
+        "embedding_model": EMBEDDING_MODEL_NAME,
+        "embedding_dimension": EMBEDDING_DIMENSION,
+        "embedding_loaded": _embedding_model is not None,
+        "reranking_enabled": RERANK_ENABLED,
+        "reranker_loaded": _RERANKER is not None,
+    }
 
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest_document(
@@ -805,13 +838,23 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
         # Qwen3 supports explicitly disabling its thinking mode for lower latency.
         if OLLAMA_MODEL.lower().startswith("qwen3"):
             payload["think"] = False
+        started = time.perf_counter()
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json=payload,
             timeout=OLLAMA_TIMEOUT_SECONDS,
         )
+        elapsed_ms = (time.perf_counter() - started) * 1000
         if resp.status_code == 200:
-            return resp.json().get("response", "").strip()
+            result = resp.json()
+            logger.info(
+                "ollama_generation model=%s elapsed_ms=%.1f prompt_tokens=%s output_tokens=%s "
+                "total_duration_ns=%s load_duration_ns=%s",
+                OLLAMA_MODEL, elapsed_ms, result.get("prompt_eval_count"),
+                result.get("eval_count"), result.get("total_duration"), result.get("load_duration")
+            )
+            return result.get("response", "").strip()
+        logger.warning("Ollama returned status=%s after %.1f ms", resp.status_code, elapsed_ms)
     except Exception as e:
         logger.warning(f"Ollama call failed: {e}")
     return None
