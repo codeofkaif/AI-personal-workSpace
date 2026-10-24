@@ -67,12 +67,25 @@ export default function AIChatPage() {
     setLoading(true)
     setSources([])
 
+    // Send recent turns so RAG can resolve pronouns and answer follow-ups.
+    // Keep a clarification marker on assistant turns so the original question
+    // can be combined with the user's clarification by the RAG service.
+    const conversationHistory = messages
+      .filter(m => m.role === 'user' || m.role === 'ai')
+      .slice(-8)
+      .map(m => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        content: m.content,
+        clarification_needed: m.role === 'ai' && Boolean(m.clarificationNeeded),
+      }))
+
     try {
-      const res = await aiApi.chat(text, 5, scope)
+      const res = await aiApi.chat(text, 5, scope, conversationHistory)
       const aiMsg = {
         id: Date.now() + 1,
         role: 'ai',
         content: res?.answer || 'No answer received from AI.',
+        clarificationNeeded: Boolean(res?.clarificationNeeded),
         sourcesRaw: res?.sources || [],
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       }
@@ -254,7 +267,7 @@ export default function AIChatPage() {
                   <div className="flex items-center justify-between pb-2.5 mb-3 border-b border-gray-100">
                     <div className="flex items-center gap-1.5 text-amber-600 font-bold text-xs">
                       <Sparkles size={14} className="text-amber-500" />
-                      <span>AI Assistant</span>
+                      <span>{msg.clarificationNeeded ? 'Clarification Needed' : 'AI Assistant'}</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <span className="text-[10px] text-gray-400 font-medium">{msg.timestamp}</span>
@@ -285,7 +298,7 @@ export default function AIChatPage() {
                     </div>
                   )}
 
-                  {msg.sourcesRaw?.length === 0 && (
+                  {!msg.clarificationNeeded && msg.sourcesRaw?.length === 0 && (
                     <p className="text-[10px] text-gray-400 mt-3 italic">
                       Direct AI Workspace query response.
                     </p>
@@ -300,7 +313,7 @@ export default function AIChatPage() {
             <div className="flex justify-start">
               <div className="bg-white border border-gray-200 rounded-2xl p-4 text-xs text-gray-500 flex items-center gap-2 shadow-xs">
                 <Loader2 size={14} className="animate-spin text-amber-500" />
-                <span>Searching your documents and generating answer...</span>
+                <span>Understanding your question and checking your documents...</span>
               </div>
             </div>
           )}
