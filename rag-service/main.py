@@ -686,8 +686,9 @@ def _classify_query_clarity(question: str, history: List[Dict[str, Any]]) -> Opt
         history_text = "\n".join(history_lines) if history_lines else "(no prior conversation)"
         prompt = (
             "You are a query-understanding classifier for a document-grounded RAG assistant. "
-            "Do not answer the user's question. Return only valid JSON with exactly these keys: "
-            '{"action":"answer"|"clarify","normalized_query":string|null,"clarification_question":string|null}.\n'
+            "Do not answer the user's question. Return only valid JSON with exactly these keys. "
+            'For an answer use {"action":"answer","normalized_query":"standalone query","clarification_question":null}; '
+            'for clarification use {"action":"clarify","normalized_query":null,"clarification_question":"one question"}.\n'
             "Rules: correct obvious spelling/grammar errors silently when intent is clear. A broad but meaningful "
             "topic is answerable. Ask one concise, specific clarification only if the intended meaning is materially "
             "ambiguous, the input is gibberish/unrecoverable, or essential context is missing. Use conversation "
