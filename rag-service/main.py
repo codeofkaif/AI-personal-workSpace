@@ -62,7 +62,10 @@ OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
 OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.85"))
 RAG_CANDIDATE_K = int(os.getenv("RAG_CANDIDATE_K", "20"))
-RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.25"))
+RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.10"))
+RERANK_ENABLED = os.getenv("RERANK_ENABLED", "false").lower() in {"1", "true", "yes"}
+RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+RAG_CANDIDATE_K = min(50, max(1, RAG_CANDIDATE_K))
 
 _embedding_model = None
 
@@ -296,6 +299,135 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
     if current:
         chunks.append("\n\n".join(current))
     return [chunk for chunk in chunks if chunk.strip()]
+
+def _metadata_dict(metadata: Any) -> Dict[str, Any]:
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        try:
+            value = json.loads(metadata)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+_RERANKER = None
+
+def _rerank_candidates(question: str, candidates: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """Optional cross-encoder reranking; RRF order remains the safe fallback."""
+    global _RERANKER
+    if not RERANK_ENABLED or len(candidates) < 2:
+        return candidates[:limit]
+    try:
+        if _RERANKER is None:
+            from sentence_transformers import CrossEncoder
+            _RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
+            logger.info("Loaded local reranker %s", RERANKER_MODEL_NAME)
+        pairs = [(question, item.get("content", "")) for item in candidates]
+        scores = _RERANKER.predict(pairs, batch_size=8, show_progress_bar=False)
+        ranked = []
+        for item, score in zip(candidates, scores):
+            candidate = dict(item)
+            candidate["rerank_score"] = float(score)
+            ranked.append(candidate)
+        ranked.sort(key=lambda item: item["rerank_score"], reverse=True)
+        return ranked[:limit]
+    except Exception:
+        logger.exception("Reranker failed; using hybrid RRF ranking")
+        return candidates[:limit]
+
+def _scope_filter(user_id: Optional[int], scope: str) -> tuple[str, tuple]:
+    """Only return personal docs for their owner and shared docs for their college."""
+    if not user_id:
+        return "FALSE", ()
+    personal = """(
+        COALESCE(d.user_id, NULLIF(dc.metadata->>'user_id', '')::bigint) = %s
+        AND COALESCE(d.is_college_doc, FALSE) IS NOT TRUE
+    )"""
+    college = """(
+        d.is_college_doc IS TRUE
+        AND d.college_id = (SELECT u.college_id FROM users u WHERE u.id = %s)
+        AND (SELECT u.college_id FROM users u WHERE u.id = %s) IS NOT NULL
+    )"""
+    if scope == "Personal Only":
+        return personal, (user_id,)
+    if scope == "College Only":
+        return college, (user_id, user_id)
+    return f"({personal} OR {college})", (user_id, user_id, user_id)
+
+def retrieve_context(question: str, question_embedding: List[float], user_id: Optional[int],
+                     scope: str, top_k: int) -> List[Dict[str, Any]]:
+    """Retrieve dense and lexical candidates; fuse rankings with Reciprocal Rank Fusion."""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    where_sql, scope_params = _scope_filter(user_id, scope)
+    candidate_k = max(top_k, RAG_CANDIDATE_K)
+    fused: Dict[int, Dict[str, Any]] = {}
+    try:
+        cur = conn.cursor()
+        dense_sql = f"""
+            SELECT dc.id, dc.content, dc.metadata,
+                   1 - (dc.embedding <=> %s::vector) AS similarity,
+                   dc.document_id, dc.chunk_index, dc.page_number
+            FROM document_chunks dc
+            LEFT JOIN documents d ON dc.document_id = d.id
+            WHERE {where_sql} AND dc.embedding IS NOT NULL
+            ORDER BY dc.embedding <=> %s::vector
+            LIMIT %s
+        """
+        cur.execute(dense_sql, (question_embedding, *scope_params, question_embedding, candidate_k))
+        for rank, row in enumerate(cur.fetchall(), start=1):
+            chunk_id, content, metadata, similarity, doc_id, chunk_index, page_number = row
+            fused[chunk_id] = {
+                "id": chunk_id, "content": content or "", "metadata": _metadata_dict(metadata),
+                "similarity": float(similarity) if similarity is not None else 0.0,
+                "document_id": doc_id, "chunk_index": chunk_index, "page_number": page_number,
+                "rrf_score": 1.0 / (60 + rank), "retrieval_methods": ["dense"]
+            }
+        keyword_sql = f"""
+            SELECT dc.id, dc.content, dc.metadata,
+                   1 - (dc.embedding <=> %s::vector) AS similarity,
+                   dc.document_id, dc.chunk_index, dc.page_number,
+                   ts_rank_cd(to_tsvector('simple', COALESCE(dc.content, '')),
+                              plainto_tsquery('simple', %s)) AS lexical_score
+            FROM document_chunks dc
+            LEFT JOIN documents d ON dc.document_id = d.id
+            WHERE {where_sql}
+              AND to_tsvector('simple', COALESCE(dc.content, '')) @@ plainto_tsquery('simple', %s)
+            ORDER BY lexical_score DESC
+            LIMIT %s
+        """
+        cur.execute(keyword_sql, (question_embedding, question, *scope_params, question, candidate_k))
+        for rank, row in enumerate(cur.fetchall(), start=1):
+            chunk_id, content, metadata, similarity, doc_id, chunk_index, page_number, lexical_score = row
+            if chunk_id in fused:
+                fused[chunk_id]["rrf_score"] += 1.0 / (60 + rank)
+                fused[chunk_id]["retrieval_methods"].append("keyword")
+            else:
+                fused[chunk_id] = {
+                    "id": chunk_id, "content": content or "", "metadata": _metadata_dict(metadata),
+                    "similarity": float(similarity) if similarity is not None else 0.0,
+                    "document_id": doc_id, "chunk_index": chunk_index, "page_number": page_number,
+                    "rrf_score": 1.0 / (60 + rank), "retrieval_methods": ["keyword"],
+                    "lexical_score": float(lexical_score or 0.0)
+                }
+        cur.close()
+        candidates = sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)
+        candidates = [
+            item for item in candidates
+            if item["similarity"] >= RAG_SIMILARITY_THRESHOLD or "keyword" in item["retrieval_methods"]
+        ]
+        candidates = _rerank_candidates(question, candidates, top_k)
+        for item in candidates:
+            meta = item["metadata"]
+            item["filename"] = meta.get("filename") or meta.get("title") or "Document"
+        return candidates
+    except Exception:
+        logger.exception("Hybrid retrieval failed")
+        return []
+    finally:
+        conn.close()
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
