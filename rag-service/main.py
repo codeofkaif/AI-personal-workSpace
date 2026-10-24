@@ -16,6 +16,7 @@ import re
 import hmac
 import shutil
 import time
+from threading import Lock
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,20 +88,23 @@ OLLAMA_NUM_PREDICT = max(64, min(1024, int(os.getenv("OLLAMA_NUM_PREDICT", "350"
 OLLAMA_TIMEOUT_SECONDS = max(5.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90")))
 
 _embedding_model = None
+_embedding_model_lock = Lock()
 
 def get_model():
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        dimension = _embedding_model.get_sentence_embedding_dimension()
-        if dimension != EMBEDDING_DIMENSION:
-            _embedding_model = None
-            raise RuntimeError(
-                f"Embedding dimension mismatch: model={dimension}, configured={EMBEDDING_DIMENSION}. "
-                "Migrate/re-embed all existing chunks before changing embedding models."
-            )
-        logger.info("Embedding model %s ready (dimension=%s)", EMBEDDING_MODEL_NAME, dimension)
+        with _embedding_model_lock:
+            if _embedding_model is None:
+                from sentence_transformers import SentenceTransformer
+                candidate = SentenceTransformer(EMBEDDING_MODEL_NAME)
+                dimension = candidate.get_sentence_embedding_dimension()
+                if dimension != EMBEDDING_DIMENSION:
+                    raise RuntimeError(
+                        f"Embedding dimension mismatch: model={dimension}, configured={EMBEDDING_DIMENSION}. "
+                        "Migrate/re-embed all existing chunks before changing embedding models."
+                    )
+                _embedding_model = candidate
+                logger.info("Embedding model %s ready (dimension=%s)", EMBEDDING_MODEL_NAME, dimension)
     return _embedding_model
 
 def get_embeddings(texts: List[str], is_query: bool = False) -> List[List[float]]:
@@ -408,6 +412,7 @@ def _metadata_dict(metadata: Any) -> Dict[str, Any]:
     return {}
 
 _RERANKER = None
+_RERANKER_LOCK = Lock()
 
 def _rerank_candidates(question: str, candidates: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     """Optional cross-encoder reranking; RRF order remains the safe fallback."""
@@ -416,9 +421,11 @@ def _rerank_candidates(question: str, candidates: List[Dict[str, Any]], limit: i
         return candidates[:limit]
     try:
         if _RERANKER is None:
-            from sentence_transformers import CrossEncoder
-            _RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
-            logger.info("Loaded local reranker %s", RERANKER_MODEL_NAME)
+            with _RERANKER_LOCK:
+                if _RERANKER is None:
+                    from sentence_transformers import CrossEncoder
+                    _RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
+                    logger.info("Loaded local reranker %s", RERANKER_MODEL_NAME)
         pairs = [(question, item.get("content", "")) for item in candidates]
         scores = _RERANKER.predict(pairs, batch_size=8, show_progress_bar=False)
         ranked = []
@@ -581,7 +588,7 @@ def health_check():
     }
 
 @app.post("/ingest", response_model=IngestResponse)
-async def ingest_document(
+def ingest_document(
     file: UploadFile = File(...),
     user_id: Optional[int] = Form(None),
     document_id: Optional[int] = Form(None)
@@ -597,7 +604,7 @@ async def ingest_document(
         suffix = os.path.splitext(filename)[1].lower()
         if suffix not in {".pdf", ".docx", ".txt", ".md"}:
             raise HTTPException(status_code=415, detail="Supported file types are PDF, DOCX, TXT, and MD.")
-        file_bytes = await file.read()
+        file_bytes = file.file.read()
         max_upload_bytes = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
         if len(file_bytes) > max_upload_bytes:
             raise HTTPException(status_code=413, detail="Uploaded file exceeds the configured size limit.")
@@ -720,7 +727,7 @@ def delete_document_chunks(
         conn.close()
 
 @app.post("/query", response_model=QueryResponse)
-async def query_ai(req: QueryRequest):
+def query_ai(req: QueryRequest):
     """Answer a user question using RAG + User Identity & Role Awareness with STRICT privacy boundaries"""
     try:
         user_profile = fetch_user_profile(req.user_id, req.user_profile)
