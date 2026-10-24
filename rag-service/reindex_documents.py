@@ -62,7 +62,9 @@ def main() -> int:
     skipped = 0
     failed = 0
     try:
-        ensure_chunk_schema(conn)
+        # A dry run must not alter schema or chunk metadata.
+        if not args.dry_run:
+            ensure_chunk_schema(conn)
         cur = conn.cursor()
         cur.execute("""
             SELECT id, title, file_url, user_id, is_college_doc
