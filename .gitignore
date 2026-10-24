@@ -1,0 +1,91 @@
+# ============================================================
+# AI Personal Workspace — Git Ignore Configuration
+# ============================================================
+
+# --- OS & System Files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# --- Environment & Secret Variables ---
+.env
+.env.*
+!.env.example
+
+# --- Node.js & Frontend (React / Vite) ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Java & Maven (Backend) ---
+target/
+**/target/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+.flattened-pom.xml
+backend/uploads/*
+!backend/uploads/.gitignore
+uploads/*
+!uploads/.gitignore
+
+# --- Python & FastAPI (RAG Service) ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+**/venv/
+ENV/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- IDE & Editor Specifics ---
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.sublime-workspace
+*.sublime-project
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*~
