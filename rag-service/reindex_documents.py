@@ -26,9 +26,11 @@ from main import (  # noqa: E402
     RAG_VECTOR_BACKEND,
     CHUNK_SIZE_TOKENS,
     CHUNK_OVERLAP_TOKENS,
+    CHUNKING_VERSION,
     chunk_text,
     ensure_chunk_schema,
     extract_pages_from_file,
+    enrich_text_for_index,
     get_db_connection,
     get_embeddings,
     logger,
@@ -98,7 +100,11 @@ def main() -> int:
 
             try:
                 file_bytes = path.read_bytes()
-                pages = [(page, text) for page, text in extract_pages_from_file(file_bytes, title or path.name) if text.strip()]
+                pages = [
+                    (page, enrich_text_for_index(text))
+                    for page, text in extract_pages_from_file(file_bytes, title or path.name)
+                    if text.strip()
+                ]
                 records = [(page, chunk) for page, text in pages for chunk in chunk_text(text)]
                 if not records:
                     skipped += 1
@@ -189,7 +195,7 @@ def main() -> int:
                     "document_id": document_id,
                     "is_college_doc": bool(is_college_doc),
                     "embedding_model": EMBEDDING_MODEL_NAME,
-                    "chunking_version": "heading-paragraph-token-v3",
+                    "chunking_version": CHUNKING_VERSION,
                     "chunk_size_tokens": CHUNK_SIZE_TOKENS,
                     "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
                 }
