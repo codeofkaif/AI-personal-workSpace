@@ -24,6 +24,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
 SERVICE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SERVICE_DIR.parent
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT_DIR / ".env")
+except ImportError:
+    pass
 sys.path.insert(0, str(SERVICE_DIR))
 
 import vector_store  # noqa: E402
