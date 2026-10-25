@@ -163,6 +163,31 @@ def test_factual_extractor_accepts_spaced_and_hyphenated_phone_number():
     assert "[Source: profile.pdf]" in answer
 
 
+def test_factual_extractor_handles_generic_my_number_from_profile():
+    context = [{
+        "filename": "profile.pdf",
+        "content": "Contact details: Mobile Number: +91 98765 43210; Roll Number: CSE-1048",
+    }]
+    answer = main._extract_factual_answer("Give me my number from uploaded document", context, "Test")
+    assert answer is not None
+    assert "+91 98765 43210" in answer
+
+
+def test_factual_extractor_handles_hindi_date_of_birth_and_roll_number():
+    dob = main._extract_factual_answer(
+        "मेरी जन्म तिथि क्या है?",
+        [{"filename": "Personal.pdf", "content": "जन्म तिथि: 17/03/2004"}],
+        "Test",
+    )
+    roll = main._extract_factual_answer(
+        "मेरा रोल नंबर बताओ",
+        [{"filename": "AdmitCard.pdf", "content": "रोल नंबर: CSE-1048"}],
+        "Test",
+    )
+    assert dob is not None and "17/03/2004" in dob
+    assert roll is not None and "CSE-1048" in roll
+
+
 def test_chunker_keeps_section_headings_with_related_content(monkeypatch):
     import vector_store
 
