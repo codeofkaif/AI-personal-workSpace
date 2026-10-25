@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Literal
 from functools import wraps
 from pathlib import Path
+from collections import OrderedDict
+import hashlib
 import os
 import json
 import logging
@@ -18,6 +20,7 @@ import re
 import hmac
 import shutil
 import time
+import unicodedata
 from threading import BoundedSemaphore, Lock
 
 # Ensure environment variables are loaded from root .env
@@ -106,6 +109,10 @@ if RAG_VECTOR_BACKEND == "qdrant":
         raise RuntimeError("Gemini embedding dimension must be between 128 and 3072.")
 CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "350"))
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
+CHUNKING_VERSION = os.getenv("CHUNKING_VERSION", "heading-paragraph-token-v3")
+RAG_ANSWER_MIN_SIMILARITY = float(os.getenv("RAG_ANSWER_MIN_SIMILARITY", "0.28"))
+RAG_QUERY_REWRITE_LLM = os.getenv("RAG_QUERY_REWRITE_LLM", "false").strip().lower() in {"1", "true", "yes", "on"}
+RAG_QUERY_EMBED_CACHE_SIZE = max(0, int(os.getenv("RAG_QUERY_EMBED_CACHE_SIZE", "256")))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
@@ -132,6 +139,9 @@ _INGEST_SEMAPHORE = BoundedSemaphore(RAG_MAX_CONCURRENT_INGESTIONS)
 
 _embedding_model = None
 _embedding_model_lock = Lock()
+_query_embed_cache: "OrderedDict[str, List[float]]" = OrderedDict()
+_query_embed_cache_lock = Lock()
+_PHONE_RE = re.compile(r"(?:\+91[\s-]*)?[6-9](?:[\s-]*\d){9}")
 
 def get_model():
     global _embedding_model
@@ -179,9 +189,66 @@ def get_embeddings(
         raise RuntimeError("Embedding model returned an invalid vector batch")
     return vectors
 
+def _embedding_cache_key(text: str) -> str:
+    # Key uses a digest, not raw text, so query content is not retained in cache diagnostics.
+    payload = f"{RAG_VECTOR_BACKEND}|{EMBEDDING_MODEL_NAME}|{EMBEDDING_DIMENSION}|query|{text}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def get_embedding(text: str, is_query: bool = False) -> List[float]:
-    """Single-text convenience wrapper around the batch embedding implementation."""
+    """Single-text wrapper with a bounded query-only cache (no document text cache)."""
+    if is_query and RAG_QUERY_EMBED_CACHE_SIZE > 0:
+        key = _embedding_cache_key(text)
+        with _query_embed_cache_lock:
+            cached = _query_embed_cache.get(key)
+            if cached is not None:
+                _query_embed_cache.move_to_end(key)
+                return list(cached)
+        vector = get_embeddings([text], is_query=True)[0]
+        with _query_embed_cache_lock:
+            _query_embed_cache[key] = list(vector)
+            _query_embed_cache.move_to_end(key)
+            while len(_query_embed_cache) > RAG_QUERY_EMBED_CACHE_SIZE:
+                _query_embed_cache.popitem(last=False)
+        return vector
     return get_embeddings([text], is_query=is_query)[0]
+
+
+def normalize_extracted_text(text: str) -> str:
+    """Normalize extraction artifacts without altering the exact value or punctuation."""
+    if not text:
+        return ""
+    value = unicodedata.normalize("NFC", text).replace("\x00", "")
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def compact_digit_runs(text: str) -> str:
+    """Compact digits split by common PDF/OCR whitespace or hyphen separators."""
+    return re.sub(r"(?<=\d)[\s-]+(?=\d)", "", text or "")
+
+
+def enrich_text_for_index(text: str) -> str:
+    """Preserve source text and add compact phone/digit forms to assist lexical retrieval."""
+    value = normalize_extracted_text(text)
+    if not value:
+        return ""
+    extras = []
+    for match in _PHONE_RE.finditer(value):
+        compact = re.sub(r"\D", "", match.group(0))
+        if compact and compact not in extras:
+            extras.append(compact)
+    compact_all = compact_digit_runs(value)
+    if compact_all != value and compact_all not in extras:
+        extras.append(compact_all)
+    return value + ("\n" + " ".join(extras) if extras else "")
+
+
+def content_fingerprint(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 # ── DB Connection ─────────────────────────────────────────────────────────────
 
