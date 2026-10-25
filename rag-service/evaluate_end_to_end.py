@@ -191,6 +191,9 @@ def main() -> int:
             "expected_fact_match_rate": round(matched_expected_facts / total_expected_facts, 4) if total_expected_facts else None,
             "answerable_case_pass_rate": round(sum(bool(item["passed"]) for item in answerable) / len(answerable), 4) if answerable else None,
             "correct_refusal_rate": round(sum(bool(item.get("refusal_correct")) for item in refusals) / len(refusals), 4) if refusals else None,
+            "unsupported_answer_rate_on_unanswerable_cases": round(
+                sum(not bool(item.get("refusal_correct")) for item in refusals) / len(refusals), 4
+            ) if refusals else None,
             "mean_source_precision": round(statistics.mean(source_precisions), 4) if source_precisions else None,
             "mean_source_recall": round(statistics.mean(source_recalls), 4) if source_recalls else None,
             "forbidden_term_leakage_cases": sum(1 for item in details if item.get("forbidden_term_hits", 0)),
