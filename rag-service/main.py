@@ -946,9 +946,13 @@ def _classify_query_clarity(question: str, history: List[Dict[str, Any]]) -> Opt
 
 
 def understand_query(question: str, conversation_history: List[ConversationTurn]) -> Dict[str, Any]:
-    """Return normalized text or a clarification question before database retrieval."""
+    """Normalize query before search; defer ordinary clarification until retrieval recovery fails."""
     history = _history_as_dicts(conversation_history)
     pending = _pending_clarification_query(question, history)
+    candidate = pending or (question or "").strip()
+
+    # If the user answered only "yes" to an earlier post-retrieval clarification, do not
+    # invent which option they chose. This is the sole pre-retrieval clarification exception.
     if pending and _AFFIRMATIVE_ONLY_RE.fullmatch((question or "").strip()):
         return {
             "action": "clarify",
@@ -958,158 +962,18 @@ def understand_query(question: str, conversation_history: List[ConversationTurn]
                 "rather than replying only “yes”?"
             ),
         }
-    if pending:
-        # Re-evaluate the combined intent so a plain "yes" doesn't guess which option was meant.
-        if RAG_QUERY_CLARIFICATION_ENABLED:
-            classified = _classify_query_clarity(pending, history)
-            if classified:
-                return classified
-        return {"action": "answer", "normalized_query": pending, "clarification_question": None}
 
-    direct = _obvious_clarification(question, history)
-    if direct:
-        return {"action": "clarify", "normalized_query": None, "clarification_question": direct}
-
-    if not RAG_QUERY_CLARIFICATION_ENABLED or not _needs_clarity_preflight(question, history):
-        return {"action": "answer", "normalized_query": question.strip(), "clarification_question": None}
-
-    classified = _classify_query_clarity(question, history)
-    if classified:
-        return classified
-    # If Ollama is unreachable, don't block every short query; only deterministic obvious cases clarify.
-    return {"action": "answer", "normalized_query": question.strip(), "clarification_question": None}
-
-
-def _retrieval_has_relevant_evidence(candidates: List[Dict[str, Any]], question: str) -> bool:
-    """Use calibrated backend similarity gates before passing any evidence to generation."""
-    if not candidates:
-        return False
-    if RAG_VECTOR_BACKEND == "qdrant":
-        threshold = float(os.getenv("QDRANT_MIN_DENSE_SCORE", "0.35"))
-    else:
-        threshold = RAG_SIMILARITY_THRESHOLD
-    if any(float(item.get("similarity") or 0.0) >= threshold for item in candidates):
-        return True
-    # Exact-fact queries may legitimately be found by keyword retrieval when their
-    # dense similarity is lower. Only this explicit query class receives that exception.
-    exact_fact_intent = bool(re.search(
-        r"phone|mobile|contact|whatsapp|telephone|email|e-mail|roll|enrollment|student\\s*id|cgpa|gpa|date of birth|\\bdob\\b",
-        question, re.IGNORECASE,
-    ))
-    return exact_fact_intent and any("keyword" in item.get("retrieval_methods", []) for item in candidates)
-
-
-def _retrieval_query_variants(question: str) -> List[str]:
-    """Generate up to two alternate search formulations only after the initial search is weak."""
-    normalized = re.sub(r"\\s+", " ", (question or "").strip())
-    variants: List[str] = []
-    rules = (
-        (r"phone|mobile|contact|whatsapp|telephone", "mobile phone telephone contact number WhatsApp"),
-        (r"email|e-mail|mail address", "email e-mail contact address"),
-        (r"roll|enrollment|student\\s*id", "roll number enrollment number student ID"),
-        (r"cgpa|gpa", "CGPA GPA grade point average"),
-        (r"date of birth|\\bdob\\b", "date of birth birth date DOB"),
-        (r"\\b(mera|meri|mere|mujhe|batao|dikhao)\\b", "my personal uploaded document details"),
-    )
-    for pattern, aliases in rules:
-        if re.search(pattern, normalized, re.IGNORECASE):
-            variants.append(f"{normalized} {aliases}")
-            break
-
-    # Local LLM expansion is deliberately a recovery path, not an extra call on every query.
-    rewritten = _call_ollama(
-        "Create at most two alternative retrieval queries for a document search. "
-        "Preserve the original intent and named entities; do not answer the question or invent facts. "
-        "Include natural English/Hindi/Hinglish synonyms only when helpful. Return valid JSON as "
-        '{"queries":["query 1","query 2"]}.\nOriginal question: ' + normalized + "\nJSON:",
-        max_tokens=140,
-    )
-    if rewritten:
-        try:
-            parsed = json.loads(rewritten)
-            raw_queries = parsed.get("queries", []) if isinstance(parsed, dict) else parsed
-            if isinstance(raw_queries, list):
-                variants.extend(value.strip() for value in raw_queries if isinstance(value, str) and value.strip())
-        except Exception:
-            # Never use unvalidated free-form generation as a query list.
-            logger.debug("Retrieval rewrite was not valid JSON.")
-    result: List[str] = []
-    seen = {normalized.casefold()}
-    for value in variants:
-        item = re.sub(r"\\s+", " ", value).strip()[:1000]
-        if item and item.casefold() not in seen:
-            seen.add(item.casefold())
-            result.append(item)
-        if len(result) >= 2:
-            break
-    return result
-
-
-def retrieve_with_recovery(
-    question: str,
-    user_id: Optional[int],
-    scope: str,
-    top_k: int,
-    is_self: bool,
-    user_profile: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """Retrieve, retry only on no/weak evidence, fuse results, and rerank against the original query."""
-    initial_embedding = get_embedding(question, is_query=True)
-    initial = retrieve_context(
-        question, initial_embedding, user_id, scope, top_k,
-        is_self=is_self, user_profile=user_profile,
-    )
-    groups = [initial]
-    if _retrieval_has_relevant_evidence(initial, question):
-        return initial
-
-    logger.info("Retrieval evidence below threshold; attempting query-rewrite recovery")
-    for variant in _retrieval_query_variants(question):
-        try:
-            embedding = get_embedding(variant, is_query=True)
-            candidates = retrieve_context(
-                variant, embedding, user_id, scope, top_k,
-                is_self=is_self, user_profile=user_profile,
-            )
-            groups.append(candidates)
-            if _retrieval_has_relevant_evidence(candidates, question):
-                # Continue through a bounded second rewrite to improve coverage/ranking.
-                continue
-        except HTTPException:
-            raise
-        except Exception:
-            logger.exception("Retrieval recovery attempt failed")
-    combined: Dict[str, Dict[str, Any]] = {}
-    for candidates in groups:
-        for candidate in candidates:
-            key = str(candidate.get("id") or candidate.get("content_hash") or candidate.get("content", "")[:100])
-            if key not in combined:
-                combined[key] = dict(candidate)
-                combined[key]["recovery_score"] = float(candidate.get("rrf_score") or 0.0)
-            else:
-                target = combined[key]
-                target["recovery_score"] += float(candidate.get("rrf_score") or 0.0)
-                methods = set(target.get("retrieval_methods", [])) | set(candidate.get("retrieval_methods", []))
-                target["retrieval_methods"] = sorted(methods)
-                if float(candidate.get("similarity") or 0) > float(target.get("similarity") or 0):
-                    target["similarity"] = candidate.get("similarity")
-    merged = sorted(combined.values(), key=lambda item: item.get("recovery_score", 0.0), reverse=True)
-    merged = _rerank_candidates(question, merged, top_k, is_self=is_self, user_profile=user_profile)
-    return merged if _retrieval_has_relevant_evidence(merged, question) else []
-
-
-def _no_evidence_followup(question: str) -> str:
-    """Ask for a useful narrowing detail only after dense, sparse, and rewrite retrieval fail."""
-    if re.search(r"\\b(mera|meri|mujhe|batao|dikhao|kya|hai|ka|ki|ke)\\b", question, re.IGNORECASE):
-        return (
-            "Maine available documents mein semantic search, keyword search aur alternate query se bhi "
-            "relevant text verify nahi kar paya. Aap kis uploaded document ya topic ke andar search karwana "
-            "chahte hain? File ka naam ya uska topic bata dein."
-        )
-    return (
-        "I couldn't verify a relevant passage after semantic search, keyword search, and alternate queries. "
-        "Which uploaded document or topic should I focus on? A filename or a few topic keywords will help."
-    )
+    # A clarity classifier may improve a search query, but its "clarify" decision must not
+    # short-circuit retrieval. The document evidence and recovery pipeline gets first chance.
+    if RAG_QUERY_CLARIFICATION_ENABLED and _needs_clarity_preflight(candidate, history):
+        classified = _classify_query_clarity(candidate, history)
+        if classified and classified.get("action") == "answer":
+            normalized = classified.get("normalized_query")
+            if isinstance(normalized, str) and normalized.strip():
+                candidate = normalized.strip()[:4000]
+    if not candidate:
+        candidate = (question or "").strip()
+    return {"action": "answer", "normalized_query": candidate, "clarification_question": None}
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -1522,6 +1386,25 @@ def query_ai(req: QueryRequest):
             )
 
         context_items: List[Dict[str, Any]] = []
+
+        # Retrieve first, then recover with query rewrites if evidence is absent or weak.
+        requested_k = max(1, min(int(req.top_k or 5), 8))
+        context_items = retrieve_with_recovery(
+            effective_question,
+            req.user_id,
+            scope,
+            requested_k,
+            is_self,
+            user_profile,
+        )
+        context_items = select_context_items(context_items)
+        if not context_items:
+            return QueryResponse(
+                answer=_no_evidence_followup(effective_question),
+                sources=[],
+                chunks_used=0,
+                clarification_needed=True,
+            )
         sources = []
 
         # 1. Embed question
