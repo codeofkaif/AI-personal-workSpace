@@ -23,6 +23,7 @@ sys.path.insert(0, str(SERVICE_DIR))
 
 from main import (  # noqa: E402
     EMBEDDING_MODEL_NAME,
+    RAG_VECTOR_BACKEND,
     CHUNK_SIZE_TOKENS,
     CHUNK_OVERLAP_TOKENS,
     chunk_text,
@@ -63,13 +64,15 @@ def main() -> int:
     failed = 0
     try:
         # A dry run must not alter schema or chunk metadata.
-        if not args.dry_run:
+        if not args.dry_run and RAG_VECTOR_BACKEND == "pgvector":
             ensure_chunk_schema(conn)
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, title, file_url, user_id, is_college_doc
-            FROM documents
-            ORDER BY id
+            SELECT d.id, d.title, d.file_url, d.user_id, d.is_college_doc,
+                   COALESCE(d.college_id, u.college_id) AS college_id
+            FROM documents d
+            LEFT JOIN users u ON u.id = d.user_id
+            ORDER BY d.id
         """)
         documents = cur.fetchall()
         cur.close()
@@ -77,7 +80,7 @@ def main() -> int:
         print(f"Chunk strategy: paragraph/token v2, target={CHUNK_SIZE_TOKENS}, overlap={CHUNK_OVERLAP_TOKENS}")
         print(f"Documents discovered: {len(documents)}; dry_run={args.dry_run}")
 
-        for document_id, title, file_url, user_id, is_college_doc in documents:
+        for document_id, title, file_url, user_id, is_college_doc, college_id in documents:
             if not file_url:
                 skipped += 1
                 print(f"SKIP id={document_id} title={title!r}: no stored file_url")
@@ -96,17 +99,47 @@ def main() -> int:
                     skipped += 1
                     print(f"SKIP id={document_id} title={title!r}: no readable text (scanned PDFs need OCR)")
                     continue
-                vectors = get_embeddings([chunk for _, chunk in records])
+                chunk_texts = [chunk for _, chunk in records]
+                if RAG_VECTOR_BACKEND == "qdrant":
+                    vectors = get_embeddings(chunk_texts, titles=[title or path.name] * len(chunk_texts))
+                else:
+                    vectors = get_embeddings(chunk_texts)
                 if args.dry_run:
                     succeeded += 1
                     print(f"DRY-RUN id={document_id} title={title!r}: {len(records)} chunks validated")
                     continue
 
                 cur = conn.cursor()
-                # Each document is replaced atomically; the previous index remains if inserting fails.
+                # Verify the source row still exists and is stable before replacing the index.
                 cur.execute("SELECT id FROM documents WHERE id = %s FOR UPDATE", (document_id,))
                 if cur.fetchone() is None:
                     raise RuntimeError("document record disappeared during reindex")
+
+                if RAG_VECTOR_BACKEND == "qdrant":
+                    from vector_store import upsert_document_chunks
+                    if bool(is_college_doc) and college_id is None:
+                        raise RuntimeError("college-scoped document has no verified college_id")
+                    items = [
+                        {
+                            "content": content,
+                            "filename": title or path.name,
+                            "user_id": int(user_id),
+                            "document_id": int(document_id),
+                            "document_key": f"document:{document_id}",
+                            "is_college_doc": bool(is_college_doc),
+                            "college_id": int(college_id) if college_id is not None and bool(is_college_doc) else None,
+                            "page_number": page_number,
+                            "chunk_index": index,
+                        }
+                        for index, (page_number, content) in enumerate(records)
+                    ]
+                    upsert_document_chunks(items, vectors)
+                    conn.commit()
+                    cur.close()
+                    succeeded += 1
+                    print(f"OK id={document_id} title={title!r}: {len(records)} Qdrant chunks")
+                    continue
+
                 cur.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
                 metadata = {
                     "filename": title or path.name,
@@ -114,7 +147,7 @@ def main() -> int:
                     "document_id": document_id,
                     "is_college_doc": bool(is_college_doc),
                     "embedding_model": EMBEDDING_MODEL_NAME,
-                    "chunking_version": "paragraph-token-v2",
+                    "chunking_version": "heading-paragraph-token-v3",
                     "chunk_size_tokens": CHUNK_SIZE_TOKENS,
                     "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
                 }
@@ -140,7 +173,7 @@ def main() -> int:
         print(f"\nSummary: succeeded={succeeded}, skipped={skipped}, failed={failed}")
         if args.dry_run:
             print("Dry run only: the database index was not modified.")
-        return 1 if failed else 0
+        return 1 if failed or skipped else 0
     finally:
         conn.close()
 
