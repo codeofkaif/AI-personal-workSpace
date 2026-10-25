@@ -469,6 +469,8 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
         all_caps_heading = (
             len(part) <= 100
             and "\n" not in part
+            and ":" not in part
+            and not re.search(r"\\d", part)
             and part.isupper()
             and any(character.isalpha() for character in part)
         )
