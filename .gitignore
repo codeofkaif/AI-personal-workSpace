@@ -52,6 +52,7 @@ backend/src/main/resources/application.properties
 rag-service/evaluation/latest-report.json
 rag-service/evaluation/latest-embedding-report.json
 rag-service/evaluation/latest-e2e-report.json
+rag-service/evaluation/latest-chunking-report.json
 __pycache__/
 **/__pycache__/
 *.py[cod]
