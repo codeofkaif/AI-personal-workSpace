@@ -53,14 +53,31 @@ def _unstructured_pages(file_bytes: bytes, filename: str) -> List[Tuple[int, str
     return [(page, "\n\n".join(parts).strip()) for page, parts in grouped.items() if parts]
 
 
-def _pdf_pages(file_bytes: bytes, ocr_enabled: bool, ocr_lang: str) -> List[Tuple[int, str]]:
+def _pdf_pages(
+    file_bytes: bytes,
+    filename: str,
+    ocr_enabled: bool,
+    ocr_lang: str,
+) -> List[Tuple[int, str]]:
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(file_bytes))
     result: List[Tuple[int, str]] = []
+    unreadable_image_pages: List[int] = []
+    tesseract_available = bool(shutil.which("tesseract"))
     for index, page in enumerate(reader.pages):
         text = (page.extract_text() or "").replace("\x00", "").strip()
-        if not text and ocr_enabled and shutil.which("tesseract"):
+        likely_scanned = False
+        try:
+            # A reasonably large embedded raster image on an otherwise empty page
+            # is a useful scan signal; tiny logos do not trigger the strict check.
+            likely_scanned = any(
+                len(getattr(image, "data", b"") or b"") >= 20000
+                for image in page.images
+            )
+        except Exception:
+            pass
+        if not text and ocr_enabled and tesseract_available:
             try:
                 import fitz
                 import pytesseract
@@ -72,8 +89,19 @@ def _pdf_pages(file_bytes: bytes, ocr_enabled: bool, ocr_lang: str) -> List[Tupl
                         image, lang=ocr_lang, config="--psm 3"
                     ) or "").replace("\x00", "").strip()
             except Exception:
-                logger.exception("PDF OCR failed on page %s of %s", index + 1, filename_for_log(file_bytes))
+                logger.exception("PDF OCR failed for %s page %s", filename, index + 1)
+        if likely_scanned and not text:
+            unreadable_image_pages.append(index + 1)
         result.append((index + 1, text))
+    if unreadable_image_pages:
+        pages = ", ".join(str(page) for page in unreadable_image_pages[:20])
+        extra = "" if ocr_enabled and tesseract_available else (
+            " Tesseract OCR is disabled or unavailable; install Tesseract and required language packs."
+        )
+        raise ValueError(
+            f"Could not extract readable text from likely scanned page(s) {pages} in '{filename}'. "
+            "The document was not indexed to avoid partial-coverage answers." + extra
+        )
     if any(text.strip() for _, text in result):
         return result
     # Optional layout-aware OCR fallback. Tesseract may not be installed or able to read a scan.
@@ -84,11 +112,6 @@ def _pdf_pages(file_bytes: bytes, ocr_enabled: bool, ocr_lang: str) -> List[Tupl
     except Exception:
         logger.info("Unstructured PDF fallback was unavailable; no readable PDF text extracted.")
     return result
-
-
-def filename_for_log(_file_bytes: bytes) -> str:
-    # Do not log document content or derive identifiers from private file bytes.
-    return "uploaded document"
 
 
 def _docx_native(file_bytes: bytes) -> List[Tuple[int, str]]:
@@ -171,7 +194,7 @@ def extract_document_pages(file_bytes: bytes, filename: str) -> List[Tuple[int, 
     ocr_lang = os.getenv("OCR_LANG", "eng")
 
     if suffix == ".pdf":
-        return _pdf_pages(file_bytes, ocr_enabled, ocr_lang)
+        return _pdf_pages(file_bytes, name, ocr_enabled, ocr_lang)
     if suffix == ".docx":
         try:
             parts = _unstructured_pages(file_bytes, name)
