@@ -1250,12 +1250,17 @@ def health_check():
         warnings.append(f"Configured Ollama model '{OLLAMA_MODEL}' is not installed; run 'ollama pull {OLLAMA_MODEL}'.")
     if RAG_VECTOR_BACKEND == "qdrant" and not vector_store_status.get("available", False):
         warnings.append("Qdrant is unavailable; verify QDRANT_URL and that the service is running.")
+    if RAG_VECTOR_BACKEND == "qdrant" and vector_store_status.get("available", False) and not vector_store_status.get("collection_exists", False):
+        warnings.append("The configured Qdrant collection is missing or has an incompatible schema; verify initialization and re-indexing.")
     if RAG_VECTOR_BACKEND == "qdrant" and not os.getenv("GEMINI_API_KEY", "").strip():
         warnings.append("GEMINI_API_KEY is not configured; Gemini embedding requests will fail until set in local .env.")
     if OCR_ENABLED and not tesseract_available:
         warnings.append("OCR is enabled but Tesseract is not installed; scanned/image-only PDFs may not be searchable.")
 
-    ready = database_ok and ollama_api_ok and configured_model_ok and bool(vector_store_status.get("available", False))
+    vector_ready = bool(vector_store_status.get("available", False))
+    if RAG_VECTOR_BACKEND == "qdrant":
+        vector_ready = vector_ready and bool(vector_store_status.get("collection_exists", False))
+    ready = database_ok and ollama_api_ok and configured_model_ok and vector_ready
     return {
         "status": "healthy" if ready else "degraded",
         "service": "RAG Service",
@@ -1304,7 +1309,10 @@ def ingest_document(
         max_upload_bytes = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
         if len(file_bytes) > max_upload_bytes:
             raise HTTPException(status_code=413, detail="Uploaded file exceeds the configured size limit.")
-        logger.info("Ingesting %s (%s bytes) for user %s backend=%s", filename, len(file_bytes), user_id, RAG_VECTOR_BACKEND)
+        logger.info(
+            "rag_ingest user_id=%s extension=%s bytes=%s backend=%s",
+            user_id, suffix, len(file_bytes), RAG_VECTOR_BACKEND,
+        )
 
         try:
             extracted_pages = extract_pages_from_file(file_bytes, filename)
