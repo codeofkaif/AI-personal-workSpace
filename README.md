@@ -316,7 +316,7 @@ python rag-service/benchmark_embedding_models.py \
   rag-service/evaluation/embedding_benchmark_sample.jsonl \
   --models gemini-embedding-2 gemini-embedding-001 \
   --dimension 768 \
-  --output rag-service/evaluation/embedding-benchmark-report.json
+  --output rag-service/evaluation/latest-embedding-report.json
 ```
 
 The sample set is synthetic; it is a harness check only, not evidence that either model is more accurate for your private documents. Use manually labelled, consented, redacted data for model selection. The report measures dense-only Recall@5/10, MRR@10, nDCG@10, embedding latency and request counts. Actual billing should be checked in the provider's usage dashboard.
