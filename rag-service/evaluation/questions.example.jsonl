@@ -1,0 +1,3 @@
+{"question":"What is the exam date?","user_id":12,"scope":"College + Personal","relevant_chunk_ids":[18,27],"expected_answer":"The exam is on 12 December 2026."}
+{"question":"Mera phone number kya hai?","user_id":12,"scope":"Personal Only","relevant_chunk_ids":[41],"expected_answer":"+91 98765 43210"}
+{"question":"Explain this","user_id":12,"scope":"College + Personal","relevant_chunk_ids":[],"expected_clarification":true}
