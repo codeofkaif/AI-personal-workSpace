@@ -1612,6 +1612,20 @@ def query_ai(req: QueryRequest):
         user_profile = fetch_user_profile(req.user_id, req.user_profile)
         is_self = is_self_referential_query(effective_question, user_profile)
         scope = req.scope or "College + Personal"
+        # For private contact facts, never let a shared college document's number outrank
+        # the logged-in user's own personal document. Respect an explicitly chosen College Only scope.
+        if (
+            scope == "College + Personal"
+            and is_self
+            and re.search(
+                r"\b(my|mine|mera|meri|mere)\b.{0,50}\b(phone|mobile|contact|whatsapp|email|e-mail|number)\b|"
+                r"\b(phone|mobile|contact|whatsapp|email|e-mail)\b.{0,30}\b(my|mine|mera|meri|mere)\b|"
+                r"(फोन|मोबाइल|ईमेल|संपर्क).{0,20}(मेरा|मेरी|मेरे)",
+                effective_question,
+                re.IGNORECASE,
+            )
+        ):
+            scope = "Personal Only"
         logger.info(
             "rag_query user_id=%s scope=%s self_referential=%s question_chars=%s",
             req.user_id, scope, is_self, len(effective_question),
@@ -1906,10 +1920,6 @@ _FACTUAL_PATTERNS = [
     (r"student\s*id",
      r"(?:student\s*id[:\s.-]*)(\S+)",
      "Student ID"),
-    # Email
-    (r"email",
-     r"([\w.+-]+@[\w-]+\.[\w.-]+)",
-     "Email"),
     # Email
     (r"(?:email|e-mail|ईमेल|मेल पता)",
      r"([\w.+-]+@[\w-]+\.[\w.-]+)",
