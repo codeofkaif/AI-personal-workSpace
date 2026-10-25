@@ -374,16 +374,24 @@ def test_conversation_history_is_bounded_to_most_recent_eight_turns():
     assert normalized[-1]["content"] == "Question 9"
 
 
-def test_obvious_unclear_query_returns_followup_without_db_embedding_or_generation(monkeypatch):
+def test_vague_query_retrieves_before_asking_followup(monkeypatch):
     from fastapi.testclient import TestClient
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Clarification must happen before profile lookup, embeddings and retrieval")
+    retrieve_calls = {"n": 0}
 
-    monkeypatch.setattr(main, "fetch_user_profile", forbidden)
-    monkeypatch.setattr(main, "get_embedding", forbidden)
-    monkeypatch.setattr(main, "retrieve_context", forbidden)
-    monkeypatch.setattr(main, "generate_answer", forbidden)
+    def fake_retrieve(*args, **kwargs):
+        retrieve_calls["n"] += 1
+        return []
+
+    def forbidden_generate(*args, **kwargs):
+        raise AssertionError("Do not generate an answer before the retrieval pipeline finishes")
+
+    monkeypatch.setattr(main, "fetch_user_profile", lambda user_id, passed_profile=None: {
+        "id": user_id, "name": "Test User", "role": "STUDENT", "college": "Test", "department": "CSE",
+    })
+    monkeypatch.setattr(main, "get_embedding", lambda text, is_query=False: [0.0] * main.EMBEDDING_DIMENSION)
+    monkeypatch.setattr(main, "retrieve_context", fake_retrieve)
+    monkeypatch.setattr(main, "generate_answer", forbidden_generate)
     headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
 
     with TestClient(main.app) as client:
@@ -394,6 +402,7 @@ def test_obvious_unclear_query_returns_followup_without_db_embedding_or_generati
         )
     assert response.status_code == 200, response.text
     payload = response.json()
+    assert retrieve_calls["n"] >= 1
     assert payload["clarification_needed"] is True
     assert payload["sources"] == []
     assert payload["chunks_used"] == 0
@@ -439,6 +448,7 @@ def test_classifier_can_normalize_a_typo_before_retrieval(monkeypatch):
             "normalized_query": "Explain dependency injection in Spring Boot",
             "clarification_question": None,
         }
+    monkeypatch.setattr(main, "RAG_QUERY_REWRITE_LLM", True)
     monkeypatch.setattr(main, "_classify_query_clarity", fake_classifier)
     result = main.understand_query("Explane dependancy injection in Spring Boot", [])
     assert seen["question"] == "Explane dependancy injection in Spring Boot"
@@ -446,21 +456,17 @@ def test_classifier_can_normalize_a_typo_before_retrieval(monkeypatch):
     assert result["normalized_query"] == "Explain dependency injection in Spring Boot"
 
 
-def test_ambiguous_short_query_asks_one_specific_followup(monkeypatch):
-    monkeypatch.setattr(
-        main, "_classify_query_clarity",
-        lambda question, history: {
-            "action": "clarify",
-            "normalized_query": None,
-            "clarification_question": "Do you mean the Spring Framework in Java or the spring season?",
-        },
-    )
-    result = main.understand_query("Explain Spring", [])
-    assert result["action"] == "clarify"
-    assert result["clarification_question"].endswith("season?")
+def test_ambiguous_short_query_does_not_clarify_before_retrieval():
+    result = main.understand_query("Explain this", [])
+    assert result["action"] == "answer"
+    assert "Explain this" in result["normalized_query"]
+    followup = main.followup_after_failed_retrieval("Explain this", [])
+    assert followup
+    assert main.followup_after_failed_retrieval("Explain Java collections framework iterators", []) is None
 
 
 def test_clear_short_query_proceeds_when_classifier_confirms_intent(monkeypatch):
+    monkeypatch.setattr(main, "RAG_QUERY_REWRITE_LLM", True)
     monkeypatch.setattr(
         main, "_classify_query_clarity",
         lambda question, history: {

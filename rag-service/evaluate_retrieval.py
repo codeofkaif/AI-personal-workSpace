@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 import time
@@ -21,7 +22,12 @@ from pathlib import Path
 SERVICE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SERVICE_DIR))
 
-from main import EMBEDDING_MODEL_NAME, get_embedding, retrieve_context  # noqa: E402
+from main import (  # noqa: E402
+    EMBEDDING_MODEL_NAME,
+    compact_digit_runs,
+    get_embedding,
+    retrieve_context,
+)
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
@@ -30,6 +36,39 @@ def percentile(values: list[float], fraction: float) -> float | None:
     ordered = sorted(values)
     index = min(len(ordered) - 1, max(0, math.ceil(fraction * len(ordered)) - 1))
     return round(ordered[index], 4)
+
+
+FACT_TOKEN_RE = re.compile(
+    r"[\w.+-]+@[\w.-]+\.\w+|(?:\+91[\s-]*)?[6-9](?:[\s-]*\d){9}|\b\d+(?:\.\d+)?\b"
+)
+
+
+def recall_at_k(retrieved_ids: list[int], relevant_ids: set[int], k: int) -> float:
+    if not relevant_ids:
+        return 0.0
+    hits = sum(1 for chunk_id in retrieved_ids[:k] if chunk_id in relevant_ids)
+    return hits / len(relevant_ids)
+
+
+def mrr_at_k(retrieved_ids: list[int], relevant_ids: set[int], k: int) -> float:
+    for rank, chunk_id in enumerate(retrieved_ids[:k], start=1):
+        if chunk_id in relevant_ids:
+            return 1.0 / rank
+    return 0.0
+
+
+def answer_faithfulness(answer: str, contexts: list[str]) -> float:
+    """Share of numeric/contact facts in the answer that also appear in retrieved context."""
+    facts = FACT_TOKEN_RE.findall(answer or "")
+    blob = compact_digit_runs(" ".join(contexts or []).lower())
+    if not facts:
+        return 1.0 if blob.strip() else 0.0
+    hits = 0
+    for fact in facts:
+        needle = compact_digit_runs(fact).lower()
+        if needle and needle in blob:
+            hits += 1
+    return hits / len(facts)
 
 
 def ndcg_at_k(retrieved_ids: list[int], relevant_ids: set[int], k: int) -> float:
@@ -100,10 +139,8 @@ def main() -> int:
         }
         if relevant:
             scored += 1
-            hits5 = sum(1 for chunk_id in ids[:5] if chunk_id in relevant)
-            recall5.append(hits5 / len(relevant))
-            positions = [rank for rank, chunk_id in enumerate(ids[:10], start=1) if chunk_id in relevant]
-            mrr10.append(1.0 / positions[0] if positions else 0.0)
+            recall5.append(recall_at_k(ids, relevant, 5))
+            mrr10.append(mrr_at_k(ids, relevant, 10))
             ndcg5.append(ndcg_at_k(ids, relevant, 5))
             detail["relevant_chunk_ids"] = sorted(relevant)
             detail["recall_at_5"] = round(recall5[-1], 4)

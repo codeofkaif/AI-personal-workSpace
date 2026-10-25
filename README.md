@@ -228,8 +228,8 @@ Important settings:
 ### What the RAG service now uses
 
 - **Embeddings:** intfloat/multilingual-e5-small (384 dimensions), with the required query: and passage: prefixes. It is a multilingual retrieval model; language support does not guarantee equal quality for every language. See the [model card](https://huggingface.co/intfloat/multilingual-e5-small).
-- **Chunking:** paragraph-aware token chunks, configurable with CHUNK_SIZE_TOKENS (default 350) and CHUNK_OVERLAP_TOKENS (default 50). PDF page numbers are retained. Context assembly deduplicates chunks and obeys RAG_CONTEXT_TOKEN_BUDGET (default 1800) and RAG_CONTEXT_CHUNKS (default 4).
-- **Retrieval:** dense pgvector search and PostgreSQL full-text search, fused using Reciprocal Rank Fusion. Concurrent query and ingestion limits prevent local inference work from growing without bounds.
+- **Chunking:** heading- and paragraph-aware token chunks, configurable with CHUNK_SIZE_TOKENS (default 350) and CHUNK_OVERLAP_TOKENS (default 50). PDF page numbers, content hashes, and heading metadata are retained. Duplicate chunks are dropped. Context assembly obeys RAG_CONTEXT_TOKEN_BUDGET (default 1800) and RAG_CONTEXT_CHUNKS (default 4).
+- **Retrieval:** dense pgvector search and PostgreSQL full-text search, fused using Reciprocal Rank Fusion, then optional rerank. Weak first-pass results retry with query expansion. Concurrent query and ingestion limits prevent local inference work from growing without bounds. Candidate cosine threshold is RAG_SIMILARITY_THRESHOLD (default 0.10); answering requires RAG_ANSWER_MIN_SIMILARITY (default 0.28) or a keyword hit.
 - **Reranking:** optional local cross-encoder, configured with RERANK_ENABLED and RERANKER_MODEL_NAME. The configured multilingual MS MARCO cross-encoder was trained using translated ranking data; verify performance on this project's own Hindi/Hinglish and English test set. See [its model card](https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1).
 - **Generation:** Ollama with the model selected by `OLLAMA_MODEL` (the safe example uses `qwen3.5:9b-q4_K_M`), temperature=0.1, num_ctx=4096, bounded output tokens, and a keep-warm interval. These are starting defaults; benchmark your actual hardware and questions before changing them. Set `RAG_WARMUP_ON_STARTUP=true` to load embedding/reranker/LLM models before serving requests and reduce first-query latency (at the cost of slower startup).
 - **Evidence handling:** invalid source labels cause excerpt fallback; if no source label is emitted, the service appends the actual retrieved source labels. This is source-label validation, not a guarantee that every natural-language claim is entailed by the source.
@@ -260,11 +260,11 @@ The embedding model and chunking strategy changed. Old vectors must not be mixed
 
 The script replaces each document's chunks atomically and reports missing files rather than silently dropping them. If a source file is missing, re-upload it through the application before proceeding. Scanned PDFs can use optional local OCR through PyMuPDF + Tesseract. On macOS, install the Tesseract binary (for example, brew install tesseract); then verify its language packs with tesseract --list-langs. Set OCR_LANG=eng+hin only when both language packs are installed. If Tesseract is unavailable or OCR returns no text, ingestion reports that no readable text was indexed rather than claiming success.
 
-### Intelligent query clarification
+### Query rewrite, retrieval, then optional clarification
 
-The chat can ask a follow-up before document retrieval when a query is materially ambiguous, missing context, or difficult to interpret. Clear queries with obvious typos are normalized and sent through the normal RAG path. Recent user/assistant turns are passed from React through Spring Boot to FastAPI so follow-ups such as “what are its drawbacks?” can be resolved from the chat context.
+Queries are normalized and rewritten from recent chat turns first. Hybrid retrieval, scope filters, reranking, and query expansion always run before the assistant asks a follow-up. A concise clarification is returned only when that full pipeline finds no sufficiently relevant chunks and the prompt is still ambiguous, or when a previous clarification was answered with only “yes”. Set `RAG_QUERY_REWRITE_LLM=true` to optionally use Ollama for typo correction; it does not skip retrieval. `RAG_QUERY_CLARIFICATION_ENABLED=true` controls post-retrieval follow-ups.
 
-Configure `RAG_QUERY_CLARIFICATION_ENABLED=true` in the root `.env` to enable the pre-retrieval classifier. It uses the configured Ollama model with a small context/output budget; this adds a model call for short, referential, or potentially garbled queries. If the classifier is unavailable, the service uses deterministic clarification for obviously incomplete prompts and otherwise falls back to the original query. A clarification API response has `clarification_needed=true`, an empty source list, and `chunks_used=0`; no vector/keyword search or answer generation is performed for that turn. The user’s next reply should name the intended topic/option rather than just “yes”.
+Copy `.env.example` to `.env` for local configuration.
 
 ### Regression tests
 
@@ -283,7 +283,7 @@ Build a manually verified JSONL dataset using real user IDs and relevant chunk I
 set -a
 source .env
 set +a
-python rag-service/evaluate_retrieval.py rag-service/evaluation/questions.jsonl --output rag-service/evaluation/latest-report.json
+python rag-service/evaluate_retrieval.py rag-service/evaluation/questions.example.jsonl --output rag-service/evaluation/latest-report.json
 \`\`\`
 
 Each line should look like:

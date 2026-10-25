@@ -185,8 +185,17 @@ export const aiApi = {
       body: JSON.stringify({ question, topK, scope, conversationHistory }),
     }),
   status: () => apiFetch('/api/ai/status'),
-  ragHealth: () =>
-    fetch(`${RAG_URL}/health`).then((r) => r.json()).catch(() => ({ status: 'offline' })),
+  ragHealth: async () => {
+    try {
+      const res = await apiFetch('/api/ai/status');
+      const state = String(res?.rag_service || '').toUpperCase();
+      if (state === 'ONLINE') return { status: 'healthy' };
+      if (state === 'DEGRADED') return { status: 'degraded' };
+      return { status: 'offline' };
+    } catch {
+      return { status: 'offline' };
+    }
+  },
 };
 
 // ── Conversations API ─────────────────────────────────────────────────────────

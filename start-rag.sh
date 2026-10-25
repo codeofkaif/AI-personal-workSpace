@@ -54,4 +54,14 @@ if [[ "${RAG_ENV:-development}" != "production" && "${RAG_RELOAD:-false}" == "tr
     UVICORN_ARGS+=(--reload --reload-include "*.py")
 fi
 
-exec python3 -m uvicorn main:app --host "${RAG_HOST:-127.0.0.1}" --port "${RAG_PORT:-8000}" "${UVICORN_ARGS[@]}"
+# Free port if already in use by a stale or suspended process
+RAG_PORT="${RAG_PORT:-8000}"
+EXISTING_PID=$(lsof -ti :"$RAG_PORT" 2>/dev/null)
+if [ -n "$EXISTING_PID" ]; then
+    echo "⚠️  Port $RAG_PORT is already in use by PID(s): $EXISTING_PID"
+    echo "   Cleaning up previous process on port $RAG_PORT..."
+    kill -9 $EXISTING_PID 2>/dev/null || true
+    sleep 1
+fi
+
+exec python3 -m uvicorn main:app --host "${RAG_HOST:-127.0.0.1}" --port "$RAG_PORT" "${UVICORN_ARGS[@]}"
