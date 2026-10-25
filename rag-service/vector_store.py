@@ -425,8 +425,24 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
         )
     client = get_qdrant_client()
     models = _qdrant_models()
+    existing = {entry.name for entry in client.get_collections().collections}
+    if collection not in existing:
+        return []
     candidate_k = max(top_k, min(100, int(os.getenv("RAG_CANDIDATE_K", "30"))))
-    sparse_query = _sparse_embedding(question, query=True)
+    sparse_question = question
+    exact_patterns = (
+        (r"phone|mobile|contact|whatsapp|telephone", "phone mobile contact telephone whatsapp number"),
+        (r"email|e-mail|mail address", "email e-mail mail address contact"),
+        (r"roll|enrollment|student\\s*id", "roll number enrollment number student id"),
+        (r"cgpa|gpa", "CGPA GPA grade point average"),
+        (r"date of birth|\\bdob\\b", "date of birth DOB birth date"),
+    )
+    import re
+    for pattern, aliases in exact_patterns:
+        if re.search(pattern, question, re.IGNORECASE):
+            sparse_question += " " + aliases
+            break
+    sparse_query = _sparse_embedding(sparse_question, query=True)
     fused: Dict[str, Dict[str, Any]] = {}
     try:
         for scope_name, query_filter in _scope_filters(int(user_id), scope, college_id):
@@ -486,13 +502,33 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
                     if scope_name == "personal" and is_self:
                         candidate["rrf_score"] += 0.002
         candidates = sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)
-        threshold = float(os.getenv("QDRANT_MIN_DENSE_SCORE", "0.20"))
-        # Keep keyword-only matches for exact terms/IDs, but suppress weak dense-only noise.
+        threshold = float(os.getenv("QDRANT_MIN_DENSE_SCORE", "0.35"))
+        # A sparse-only hit is retained only for exact-fact intents or when the
+        # query has meaningful lexical overlap. Common stopwords cannot make a chunk relevant.
+        exact_fact_intent = bool(re.search(
+            r"phone|mobile|contact|whatsapp|telephone|email|e-mail|roll|enrollment|student\\s*id|cgpa|gpa|date of birth|\\bdob\\b",
+            question, re.IGNORECASE,
+        ))
+        stopwords = {
+            "what", "which", "where", "when", "who", "how", "tell", "give", "show",
+            "me", "my", "is", "are", "the", "a", "an", "of", "from", "in", "on",
+            "please", "can", "you", "mera", "meri", "mere", "mujhe", "batao", "kya",
+            "hai", "ka", "ki", "ke", "do", "i", "myself", "uploaded", "document",
+            "documents", "file", "files",
+        }
+        query_terms = {
+            token for token in re.findall(r"[\\w@.+-]+", sparse_question.lower())
+            if len(token) > 1 and token not in stopwords
+        }
+        def sparse_overlap(item):
+            content_terms = set(re.findall(r"[\\w@.+-]+", str(item.get("content", "")).lower()))
+            return len(query_terms & content_terms) / max(1, len(query_terms))
         candidates = [
             item for item in candidates
-            if "keyword" in item["retrieval_methods"]
-            or item["similarity"] >= threshold
-            or (is_self and item.get("is_personal"))
+            if item["similarity"] >= threshold
+            or (exact_fact_intent and "keyword" in item["retrieval_methods"])
+            or ("keyword" in item["retrieval_methods"] and sparse_overlap(item) >= 0.25)
+            or (is_self and item.get("is_personal") and item["similarity"] >= threshold)
         ]
         return candidates[:candidate_k]
     except Exception:
