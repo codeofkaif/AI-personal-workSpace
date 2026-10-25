@@ -1556,7 +1556,10 @@ def query_ai(req: QueryRequest):
         user_profile = fetch_user_profile(req.user_id, req.user_profile)
         is_self = is_self_referential_query(effective_question, user_profile)
         scope = req.scope or "College + Personal"
-        logger.info(f"Query: '{effective_question[:80]}' | User: {user_profile['name']} ({user_profile['role']}) | Scope: {scope} | Self-ref: {is_self}")
+        logger.info(
+            "rag_query user_id=%s scope=%s self_referential=%s question_chars=%s",
+            req.user_id, scope, is_self, len(effective_question),
+        )
 
         # Fast direct answer for simple identity/role questions
         q_clean = effective_question.strip().lower()
@@ -1652,8 +1655,12 @@ def query_ai(req: QueryRequest):
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen3.5:9b-q4_K_M")
 
-def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[str]:
-    """Call local Ollama API with tuned generation parameters"""
+def _call_ollama(
+    prompt: str,
+    max_tokens: int = OLLAMA_NUM_PREDICT,
+    timeout_seconds: Optional[float] = None,
+) -> Optional[str]:
+    """Call local Ollama API with tuned generation parameters and an optional bounded timeout."""
     try:
         import httpx
         payload = {
@@ -1683,7 +1690,8 @@ def _call_ollama(prompt: str, max_tokens: int = OLLAMA_NUM_PREDICT) -> Optional[
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json=payload,
-            timeout=OLLAMA_TIMEOUT_SECONDS,
+            timeout=max(5.0, min(OLLAMA_TIMEOUT_SECONDS, float(timeout_seconds)))
+            if timeout_seconds is not None else OLLAMA_TIMEOUT_SECONDS,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
         if resp.status_code == 200:
@@ -1882,8 +1890,8 @@ def _extract_factual_answer(
                 value = value.strip().rstrip(",.:;")
                 source = item.get("filename", "your document")
                 logger.info(
-                    "factual_extractor: found %s=%r in %s for query=%r",
-                    label, value, source, question,
+                    "factual_extractor: matched field=%s; source_available=%s",
+                    label, bool(source),
                 )
                 return (
                     f"📋 **{label}:** `{value}`\n\n"
