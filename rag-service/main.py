@@ -1153,7 +1153,7 @@ def understand_query(question: str, conversation_history: List[ConversationTurn]
 
     # A clarity classifier may improve a search query, but its "clarify" decision must not
     # short-circuit retrieval. The document evidence and recovery pipeline gets first chance.
-    if RAG_QUERY_CLARIFICATION_ENABLED and _needs_clarity_preflight(candidate, history):
+    if RAG_QUERY_REWRITE_LLM and _needs_clarity_preflight(candidate, history):
         classified = _classify_query_clarity(candidate, history)
         if classified and classified.get("action") == "answer":
             normalized = classified.get("normalized_query")
