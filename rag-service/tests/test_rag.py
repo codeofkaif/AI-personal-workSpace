@@ -589,6 +589,7 @@ def test_classifier_can_normalize_a_typo_before_retrieval(monkeypatch):
             "normalized_query": "Explain dependency injection in Spring Boot",
             "clarification_question": None,
         }
+    monkeypatch.setattr(main, "RAG_QUERY_REWRITE_LLM", True)
     monkeypatch.setattr(main, "_classify_query_clarity", fake_classifier)
     result = main.understand_query("Explane dependancy injection in Spring Boot", [])
     assert seen["question"] == "Explane dependancy injection in Spring Boot"
