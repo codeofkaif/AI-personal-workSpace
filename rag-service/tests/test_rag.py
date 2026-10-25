@@ -163,6 +163,19 @@ def test_factual_extractor_accepts_spaced_and_hyphenated_phone_number():
     assert "[Source: profile.pdf]" in answer
 
 
+def test_generic_my_number_keyword_result_passes_exact_fact_evidence_gate(monkeypatch):
+    monkeypatch.setattr(main, "RAG_VECTOR_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_MIN_DENSE_SCORE", "0.35")
+    candidates = [{
+        "id": "point-1",
+        "content": "Mobile Number: +91 98765-43210",
+        "similarity": 0.0,
+        "retrieval_methods": ["keyword"],
+    }]
+    filtered = main._filter_relevant_evidence(candidates, "Give me my number from uploaded document")
+    assert len(filtered) == 1
+
+
 def test_factual_extractor_handles_generic_my_number_from_profile():
     context = [{
         "filename": "profile.pdf",
