@@ -124,6 +124,21 @@ def stable_generation_id(items: Sequence[Dict[str, Any]], model_name: str) -> st
     return digest.hexdigest()[:24]
 
 
+def extract_heading(text: str) -> str:
+    """Extract the preserved section hierarchy from a heading-prefixed chunk."""
+    import re
+
+    headings = []
+    for line in (text or "").splitlines():
+        value = line.strip()
+        match = re.match(r"^#{1,6}\s+(.+)$", value)
+        if match:
+            headings.append(match.group(1).strip())
+        if len(headings) >= 6:
+            break
+    return " > ".join(headings)
+
+
 def stable_point_id(collection_name: str, document_key: str, generation_id: str,
                     chunk_index: int, content: str) -> str:
     body_hash = hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:16]
@@ -362,6 +377,7 @@ def ensure_qdrant_collection() -> Dict[str, Any]:
         ("index_status", models.PayloadSchemaType.KEYWORD),
         ("document_key", models.PayloadSchemaType.KEYWORD),
         ("filename", models.PayloadSchemaType.KEYWORD),
+        ("heading", models.PayloadSchemaType.KEYWORD),
         ("embedding_model", models.PayloadSchemaType.KEYWORD),
         ("embedding_dimension", models.PayloadSchemaType.INTEGER),
     ):
@@ -466,6 +482,7 @@ def upsert_document_chunks(items: Sequence[Dict[str, Any]], dense_vectors: Seque
         payload = {
             "content": str(item["content"]),
             "filename": str(item.get("filename") or "Document"),
+            "heading": str(item.get("heading") or extract_heading(str(item["content"]))),
             "user_id": int(item["user_id"]),
             "document_id": item.get("document_id"),
             "document_id_key": int(item.get("document_id") or 0),
@@ -625,6 +642,7 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
                             "content": content,
                             "metadata": {
                                 "filename": payload.get("filename") or "Document",
+                                "heading": payload.get("heading") or "",
                                 "user_id": payload.get("user_id"),
                                 "document_id": payload.get("document_id"),
                                 "embedding_model": payload.get("embedding_model"),
