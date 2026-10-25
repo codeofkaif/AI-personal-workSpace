@@ -73,6 +73,13 @@ def get_embedding_config() -> Tuple[str, int, str]:
         raise RuntimeError("Gemini embedding dimension must be between 128 and 3072.")
     if not collection:
         raise RuntimeError("QDRANT_COLLECTION_NAME cannot be empty.")
+    model_token = model.lower().replace("-", "_").replace(".", "_")
+    if model_token not in collection.lower() or str(dimension) not in collection:
+        raise RuntimeError(
+            "QDRANT_COLLECTION_NAME must include the normalized embedding model and dimension "
+            f"({model_token}_{dimension}) to prevent incompatible vectors being mixed. "
+            "Choose a new versioned collection name when changing the embedding model/dimension."
+        )
     return model, dimension, collection
 
 
@@ -304,6 +311,8 @@ def ensure_qdrant_collection() -> Dict[str, Any]:
         ("index_status", models.PayloadSchemaType.KEYWORD),
         ("document_key", models.PayloadSchemaType.KEYWORD),
         ("filename", models.PayloadSchemaType.KEYWORD),
+        ("embedding_model", models.PayloadSchemaType.KEYWORD),
+        ("embedding_dimension", models.PayloadSchemaType.INTEGER),
     ):
         try:
             client.create_payload_index(
@@ -445,9 +454,19 @@ def upsert_document_chunks(items: Sequence[Dict[str, Any]], dense_vectors: Seque
     return len(points)
 
 
-def _scope_filters(user_id: int, scope: str, college_id: Optional[int]) -> List[Tuple[str, Any]]:
+def _scope_filters(
+    user_id: int,
+    scope: str,
+    college_id: Optional[int],
+    model_name: str,
+    dimension: int,
+) -> List[Tuple[str, Any]]:
     models = _qdrant_models()
-    base = [models.FieldCondition(key="index_status", match=models.MatchValue(value="active"))]
+    base = [
+        models.FieldCondition(key="index_status", match=models.MatchValue(value="active")),
+        models.FieldCondition(key="embedding_model", match=models.MatchValue(value=model_name)),
+        models.FieldCondition(key="embedding_dimension", match=models.MatchValue(value=dimension)),
+    ]
     personal = models.Filter(must=base + [
         models.FieldCondition(key="user_id", match=models.MatchValue(value=int(user_id))),
     ], must_not=[
@@ -499,7 +518,9 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
     sparse_query = _sparse_embedding(sparse_question, query=True)
     fused: Dict[str, Dict[str, Any]] = {}
     try:
-        for scope_name, query_filter in _scope_filters(int(user_id), scope, college_id):
+        for scope_name, query_filter in _scope_filters(
+            int(user_id), scope, college_id, model_name, dimension
+        ):
             for method, query_vector in (
                 ("dense", [float(value) for value in dense_query]),
                 ("keyword", models.SparseVector(
