@@ -500,7 +500,10 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
     models = _qdrant_models()
     existing = {entry.name for entry in client.get_collections().collections}
     if collection not in existing:
-        return []
+        raise RuntimeError(
+            f"Configured Qdrant collection {collection!r} is missing. "
+            "Run ensure_qdrant_collection() and re-index source documents before querying."
+        )
     candidate_k = max(top_k, min(100, int(os.getenv("RAG_CANDIDATE_K", "30"))))
     sparse_question = question
     exact_patterns = (
