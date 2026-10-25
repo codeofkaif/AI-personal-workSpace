@@ -42,7 +42,12 @@ def resolve_document_path(file_url: str, upload_dir: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true", help="Compute chunks/embeddings, do not change DB rows")
+    parser.add_argument("--dry-run", action="store_true", help="Validate source parsing/chunking without modifying indexes or calling Gemini")
+    parser.add_argument(
+        "--verify-embeddings",
+        action="store_true",
+        help="Explicitly call the configured embedding provider during --dry-run (requires API credentials)",
+    )
     parser.add_argument(
         "--upload-dir",
         default=os.getenv("DOCUMENT_UPLOAD_DIR", str(ROOT_DIR / "backend" / "uploads")),
@@ -100,13 +105,23 @@ def main() -> int:
                     print(f"SKIP id={document_id} title={title!r}: no readable text (scanned PDFs need OCR)")
                     continue
                 chunk_texts = [chunk for _, chunk in records]
+                if args.dry_run and not args.verify_embeddings:
+                    succeeded += 1
+                    print(
+                        f"DRY-RUN id={document_id} title={title!r}: "
+                        f"{len(records)} chunks validated; embeddings skipped"
+                    )
+                    continue
                 if RAG_VECTOR_BACKEND == "qdrant":
                     vectors = get_embeddings(chunk_texts, titles=[title or path.name] * len(chunk_texts))
                 else:
                     vectors = get_embeddings(chunk_texts)
                 if args.dry_run:
                     succeeded += 1
-                    print(f"DRY-RUN id={document_id} title={title!r}: {len(records)} chunks validated")
+                    print(
+                        f"DRY-RUN id={document_id} title={title!r}: "
+                        f"{len(records)} chunks and embeddings validated"
+                    )
                     continue
 
                 cur = conn.cursor()
