@@ -647,6 +647,7 @@ def test_ambiguous_short_query_still_reaches_retrieval(monkeypatch):
 
 
 def test_clear_short_query_proceeds_when_classifier_confirms_intent(monkeypatch):
+    monkeypatch.setattr(main, "RAG_QUERY_REWRITE_LLM", True)
     monkeypatch.setattr(
         main, "_classify_query_clarity",
         lambda question, history: {
