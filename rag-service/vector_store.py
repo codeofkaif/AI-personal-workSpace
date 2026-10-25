@@ -101,7 +101,9 @@ def prepare_embedding_input(text: str, *, is_query: bool, title: Optional[str] =
 def stable_generation_id(items: Sequence[Dict[str, Any]], model_name: str) -> str:
     digest = hashlib.sha256()
     digest.update(model_name.encode("utf-8"))
-    digest.update(b"|heading-paragraph-token-v3|")
+    chunking_version = os.getenv("CHUNKING_VERSION", "heading-paragraph-token-v3")
+    digest.update(chunking_version.encode("utf-8"))
+    digest.update(b"|")
     for item in items:
         digest.update(str(item.get("document_key", "")).encode("utf-8"))
         digest.update(b"|")
@@ -494,7 +496,7 @@ def upsert_document_chunks(items: Sequence[Dict[str, Any]], dense_vectors: Seque
             "content_hash": hashlib.sha256(str(item["content"]).encode("utf-8")).hexdigest(),
             "embedding_model": model_name,
             "embedding_dimension": dimension,
-            "chunking_version": "heading-paragraph-token-v3",
+            "chunking_version": os.getenv("CHUNKING_VERSION", "heading-paragraph-token-v3"),
             "generation_id": generation_id,
             "index_status": "pending",
         }
