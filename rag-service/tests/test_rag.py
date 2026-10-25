@@ -95,6 +95,35 @@ def test_factual_extractor_accepts_spaced_and_hyphenated_phone_number():
     assert "[Source: profile.pdf]" in answer
 
 
+def test_chunker_keeps_section_headings_with_related_content(monkeypatch):
+    import vector_store
+
+    monkeypatch.setattr(main, "RAG_VECTOR_BACKEND", "qdrant")
+    monkeypatch.setattr(vector_store, "get_text_tokenizer", lambda: None)
+    chunks = main.chunk_text(
+        "## Contact Details\nMobile: +91 98765-43210\n\n## Education\nCGPA: 8.4",
+        chunk_size=64,
+        overlap=8,
+    )
+    assert any("## Contact Details" in chunk and "Mobile: +91 98765-43210" in chunk for chunk in chunks)
+    assert any("## Education" in chunk and "CGPA: 8.4" in chunk for chunk in chunks)
+
+
+def test_long_table_chunks_repeat_the_table_header(monkeypatch):
+    import vector_store
+
+    monkeypatch.setattr(main, "RAG_VECTOR_BACKEND", "qdrant")
+    monkeypatch.setattr(vector_store, "get_text_tokenizer", lambda: None)
+    rows = [
+        f"Person {i} | Mobile contact details for student number {i} and college directory record"
+        for i in range(1, 40)
+    ]
+    table = "TABLE\nName | Contact\n" + "\n".join(rows)
+    chunks = main.chunk_text(table, chunk_size=64, overlap=8)
+    assert len(chunks) > 1
+    assert all(chunk.startswith("TABLE\nName | Contact") for chunk in chunks)
+
+
 class FakeVectorBatch(list):
     def tolist(self):
         return list(self)
