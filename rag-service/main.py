@@ -74,6 +74,7 @@ class QueryResponse(BaseModel):
     sources: List[str] = []
     chunks_used: int = 0
     clarification_needed: bool = False
+    diagnostics: Optional[Dict[str, Any]] = None
 
 class IngestResponse(BaseModel):
     success: bool
@@ -1172,7 +1173,7 @@ def _filter_relevant_evidence(
     threshold = (
         float(os.getenv("QDRANT_MIN_DENSE_SCORE", "0.35"))
         if RAG_VECTOR_BACKEND == "qdrant"
-        else RAG_SIMILARITY_THRESHOLD
+        else RAG_ANSWER_MIN_SIMILARITY
     )
     exact_fact_intent = bool(re.search(
         r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|"
@@ -1220,14 +1221,16 @@ def _retrieval_query_variants(question: str) -> List[str]:
             variants.append(f"{normalized} {aliases}")
             break
 
-    rewritten = _call_ollama(
-        "Create at most two alternative retrieval queries for a document search. "
-        "Preserve the original intent and named entities; do not answer or invent facts. "
-        "Return valid JSON: {\"queries\":[\"query 1\",\"query 2\"]}.\n"
-        f"Original question: {normalized}\nJSON:",
-        max_tokens=140,
-        timeout_seconds=15,
-    )
+    rewritten = None
+    if RAG_QUERY_REWRITE_LLM:
+        rewritten = _call_ollama(
+            "Create at most two alternative retrieval queries for a document search. "
+            "Preserve the original intent and named entities; do not answer or invent facts. "
+            "Return valid JSON: {\"queries\":[\"query 1\",\"query 2\"]}.\n"
+            f"Original question: {normalized}\nJSON:",
+            max_tokens=140,
+            timeout_seconds=15,
+        )
     if rewritten:
         try:
             parsed = json.loads(rewritten)
@@ -1457,7 +1460,11 @@ def ingest_document(
             extracted_pages = extract_pages_from_file(file_bytes, filename)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        page_texts = [(page, value) for page, value in extracted_pages if value.strip()]
+        page_texts = [
+            (page, enrich_text_for_index(value))
+            for page, value in extracted_pages
+            if value.strip()
+        ]
         if not page_texts:
             message = (
                 f"No readable text could be extracted from '{filename}'. "
@@ -1601,7 +1608,7 @@ def ingest_document(
             "user_id": user_id,
             "document_id": document_id,
             "embedding_model": EMBEDDING_MODEL_NAME,
-            "chunking_version": "heading-paragraph-token-v3",
+            "chunking_version": CHUNKING_VERSION,
             "chunk_size_tokens": CHUNK_SIZE_TOKENS,
             "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
         })
@@ -1692,6 +1699,7 @@ def delete_document_chunks(
 @_bounded_endpoint(_QUERY_SEMAPHORE, "query")
 def query_ai(req: QueryRequest):
     """Answer a user question using RAG + User Identity & Role Awareness with STRICT privacy boundaries"""
+    started = time.perf_counter()
     try:
         # Clarify/normalize before profile lookup, embeddings, DB retrieval, or generation.
         understanding = understand_query(req.question, req.conversation_history)
@@ -1701,6 +1709,10 @@ def query_ai(req: QueryRequest):
                 sources=[],
                 chunks_used=0,
                 clarification_needed=True,
+                diagnostics={
+                    "stage": "pending_clarification_reply",
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                },
             )
         effective_question = understanding["normalized_query"] or req.question
 
@@ -1796,6 +1808,12 @@ def query_ai(req: QueryRequest):
                 sources=[],
                 chunks_used=0,
                 clarification_needed=True,
+                diagnostics={
+                    "stage": "post_retrieval_no_evidence",
+                    "embedding_model": EMBEDDING_MODEL_NAME,
+                    "vector_backend": RAG_VECTOR_BACKEND,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                },
             )
         sources = []
         for item in context_items:
@@ -1803,13 +1821,26 @@ def query_ai(req: QueryRequest):
             if filename not in sources:
                 sources.append(filename)
 
-        # 3. Generate grounded answer with Advanced Prompt Engineering
+        # Generate only after relevance gating and bounded recovery.
         answer = generate_answer(effective_question, context_items, user_profile, is_self)
+        diagnostics = {
+            "stage": "answer",
+            "vector_backend": RAG_VECTOR_BACKEND,
+            "embedding_model": EMBEDDING_MODEL_NAME,
+            "candidate_count": len(context_items),
+            "max_similarity": round(
+                max((float(item.get("similarity") or 0.0) for item in context_items), default=0.0),
+                4,
+            ),
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+        logger.info("rag_query_diagnostics %s", diagnostics)
 
         return QueryResponse(
             answer=answer,
             sources=sources[:5],
-            chunks_used=len(context_items)
+            chunks_used=len(context_items),
+            diagnostics=diagnostics,
         )
     except HTTPException:
         raise
