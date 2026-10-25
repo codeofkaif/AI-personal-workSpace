@@ -44,8 +44,8 @@ The system is built upon four robust, decoupled pillars:
 
 1. **Frontend (React 19 + Vite + Tailwind CSS)**: Intuitive, high-performance web interface tailored by role (Student, Faculty, HOD, Dean).
 2. **Backend (Spring Boot 3.3.5 + Java 21)**: Enterprise-grade REST API, JWT authentication, role-based authorization, database transactions, and business logic.
-3. **AI / RAG Service (FastAPI + Python 3.10+)**: Structure-aware parsing, token-aware chunking, Google Gemini embeddings, Qdrant dense + sparse hybrid retrieval, optional cross-encoder reranking, recovery search, and grounded local-LLM answers with source citations.
-4. **Data Stores**: PostgreSQL remains the source of truth for users, documents and access control. Qdrant stores versioned vectors and chunk payloads for hybrid retrieval.
+3. **AI / RAG Service (FastAPI + Python 3.10+)**: Structure-aware parsing, token-aware chunking, Google Gemini embeddings, Qdrant dense + sparse hybrid retrieval, optional reranking, evidence validation, bounded recovery and grounded local-LLM answers.
+4. **Data Stores**: PostgreSQL remains the source of truth for users, documents, permissions and metadata; Qdrant holds model-versioned vectors and indexed chunk payloads. The old pgvector path remains for rollback.
 
 ---
 
@@ -129,7 +129,7 @@ AIWorkPlace/
 - **Java Development Kit (JDK 21)**
 - **Maven** (v3.8+)
 - **Python** (v3.10+)
-- **PostgreSQL** (v14+) for application and access-control metadata; **Qdrant** for the target dense/sparse vector index. The optional legacy pgvector backend remains available for rollback.
+- **PostgreSQL** (v14+ with `pgvector` extension)
 - **Ollama** (for local LLM generation; model is configured in .env)
 
 ---
@@ -223,6 +223,20 @@ Important settings:
 
 ---
 
+## 🧠 RAG quality, model migration, and evaluation
+
+### What the RAG service uses
+
+- **Target embeddings/vector store:** Google Gemini Embedding 2 (default 768 dimensions) in a versioned Qdrant collection. `gemini-embedding-001` can be benchmarked separately. Model spaces must never be mixed.
+- **Legacy rollback:** `intfloat/multilingual-e5-small` with 384-dimensional vectors remains available only when `RAG_VECTOR_BACKEND=pgvector` is selected. Do not use Gemini vectors with the legacy schema or query one model’s vectors using another model.
+- **Chunking:** heading-aware, paragraph-aware and token-bounded chunks. Defaults are configured using `CHUNK_SIZE_TOKENS=450` and `CHUNK_OVERLAP_TOKENS=60`; page/slide metadata, headings and table headers are retained where extractable.
+- **Retrieval:** Qdrant dense + sparse retrieval uses Reciprocal Rank Fusion and scope/tenant filters. The legacy path uses PostgreSQL pgvector + full-text RRF. Query aliases, bounded retries and relevance gates aim to recover relevant evidence before returning a follow-up.
+- **Evidence gates:** `QDRANT_MIN_DENSE_SCORE` is an initial Qdrant dense score gate; `RAG_ANSWER_MIN_SIMILARITY` is the initial final-answer gate for the legacy pgvector path. Neither value is universal; calibrate with manually labelled relevant and irrelevant queries.
+- **Reranking:** optional local cross-encoder, configured with `RERANK_ENABLED` and `RERANKER_MODEL_NAME`. Measure Hindi/Hinglish quality and local memory/latency before enabling it.
+- **Generation:** Ollama with the model selected by `OLLAMA_MODEL`. Model speed, answer faithfulness and format must be validated with your actual questions.
+- **Evidence handling:** retrieved text is treated as untrusted evidence, citations are limited to retrieved filenames/pages, and low/absent evidence must not become invented facts. Source-label validation alone is not proof that every claim is entailed by the cited source.
+
+The detailed target-architecture setup, migration/rollback instructions, model-comparison harness, end-to-end evaluation and Qdrant snapshot tools are documented in the next section.
 ## 🧠 Production RAG: Gemini + Qdrant
 
 The target configuration in `.env.example` uses **Gemini Embedding 2 + Qdrant dense/sparse hybrid retrieval**. PostgreSQL remains the authoritative store for user profiles, document ownership, college membership and document metadata; it is not replaced by Qdrant.
