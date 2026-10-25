@@ -30,6 +30,6 @@ jobs:
       - name: Install lightweight test dependencies
         run: python -m pip install --upgrade pip fastapi python-multipart httpx pytest
       - name: Compile Python source
-        run: python -m py_compile main.py vector_store.py document_parser.py reindex_documents.py evaluate_retrieval.py benchmark_embedding_models.py
+        run: python -m py_compile main.py vector_store.py document_parser.py reindex_documents.py evaluate_retrieval.py benchmark_embedding_models.py evaluate_end_to_end.py backup_qdrant.py restore_qdrant.py
       - name: Run unit tests
         run: pytest -q
