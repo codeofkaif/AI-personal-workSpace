@@ -301,7 +301,7 @@ The script creates `.env` from `.env.example` **only when a local `.env` does no
 ```bash
 cd rag-service
 python -m pip install -r requirements.txt
-python -m py_compile main.py vector_store.py document_parser.py reindex_documents.py evaluate_retrieval.py
+python -m py_compile main.py vector_store.py document_parser.py reindex_documents.py evaluate_retrieval.py benchmark_embedding_models.py evaluate_end_to_end.py backup_qdrant.py restore_qdrant.py
 pytest -q
 ```
 
