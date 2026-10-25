@@ -980,6 +980,138 @@ def understand_query(question: str, conversation_history: List[ConversationTurn]
     return {"action": "answer", "normalized_query": question.strip(), "clarification_question": None}
 
 
+def _retrieval_has_relevant_evidence(candidates: List[Dict[str, Any]], question: str) -> bool:
+    """Use calibrated backend similarity gates before passing any evidence to generation."""
+    if not candidates:
+        return False
+    if RAG_VECTOR_BACKEND == "qdrant":
+        threshold = float(os.getenv("QDRANT_MIN_DENSE_SCORE", "0.35"))
+    else:
+        threshold = RAG_SIMILARITY_THRESHOLD
+    if any(float(item.get("similarity") or 0.0) >= threshold for item in candidates):
+        return True
+    # Exact-fact queries may legitimately be found by keyword retrieval when their
+    # dense similarity is lower. Only this explicit query class receives that exception.
+    exact_fact_intent = bool(re.search(
+        r"phone|mobile|contact|whatsapp|telephone|email|e-mail|roll|enrollment|student\\s*id|cgpa|gpa|date of birth|\\bdob\\b",
+        question, re.IGNORECASE,
+    ))
+    return exact_fact_intent and any("keyword" in item.get("retrieval_methods", []) for item in candidates)
+
+
+def _retrieval_query_variants(question: str) -> List[str]:
+    """Generate up to two alternate search formulations only after the initial search is weak."""
+    normalized = re.sub(r"\\s+", " ", (question or "").strip())
+    variants: List[str] = []
+    rules = (
+        (r"phone|mobile|contact|whatsapp|telephone", "mobile phone telephone contact number WhatsApp"),
+        (r"email|e-mail|mail address", "email e-mail contact address"),
+        (r"roll|enrollment|student\\s*id", "roll number enrollment number student ID"),
+        (r"cgpa|gpa", "CGPA GPA grade point average"),
+        (r"date of birth|\\bdob\\b", "date of birth birth date DOB"),
+        (r"\\b(mera|meri|mere|mujhe|batao|dikhao)\\b", "my personal uploaded document details"),
+    )
+    for pattern, aliases in rules:
+        if re.search(pattern, normalized, re.IGNORECASE):
+            variants.append(f"{normalized} {aliases}")
+            break
+
+    # Local LLM expansion is deliberately a recovery path, not an extra call on every query.
+    rewritten = _call_ollama(
+        "Create at most two alternative retrieval queries for a document search. "
+        "Preserve the original intent and named entities; do not answer the question or invent facts. "
+        "Include natural English/Hindi/Hinglish synonyms only when helpful. Return valid JSON as "
+        '{"queries":["query 1","query 2"]}.\nOriginal question: ' + normalized + "\nJSON:",
+        max_tokens=140,
+    )
+    if rewritten:
+        try:
+            parsed = json.loads(rewritten)
+            raw_queries = parsed.get("queries", []) if isinstance(parsed, dict) else parsed
+            if isinstance(raw_queries, list):
+                variants.extend(value.strip() for value in raw_queries if isinstance(value, str) and value.strip())
+        except Exception:
+            # Never use unvalidated free-form generation as a query list.
+            logger.debug("Retrieval rewrite was not valid JSON.")
+    result: List[str] = []
+    seen = {normalized.casefold()}
+    for value in variants:
+        item = re.sub(r"\\s+", " ", value).strip()[:1000]
+        if item and item.casefold() not in seen:
+            seen.add(item.casefold())
+            result.append(item)
+        if len(result) >= 2:
+            break
+    return result
+
+
+def retrieve_with_recovery(
+    question: str,
+    user_id: Optional[int],
+    scope: str,
+    top_k: int,
+    is_self: bool,
+    user_profile: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Retrieve, retry only on no/weak evidence, fuse results, and rerank against the original query."""
+    initial_embedding = get_embedding(question, is_query=True)
+    initial = retrieve_context(
+        question, initial_embedding, user_id, scope, top_k,
+        is_self=is_self, user_profile=user_profile,
+    )
+    groups = [initial]
+    if _retrieval_has_relevant_evidence(initial, question):
+        return initial
+
+    logger.info("Retrieval evidence below threshold; attempting query-rewrite recovery")
+    for variant in _retrieval_query_variants(question):
+        try:
+            embedding = get_embedding(variant, is_query=True)
+            candidates = retrieve_context(
+                variant, embedding, user_id, scope, top_k,
+                is_self=is_self, user_profile=user_profile,
+            )
+            groups.append(candidates)
+            if _retrieval_has_relevant_evidence(candidates, question):
+                # Continue through a bounded second rewrite to improve coverage/ranking.
+                continue
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Retrieval recovery attempt failed")
+    combined: Dict[str, Dict[str, Any]] = {}
+    for candidates in groups:
+        for candidate in candidates:
+            key = str(candidate.get("id") or candidate.get("content_hash") or candidate.get("content", "")[:100])
+            if key not in combined:
+                combined[key] = dict(candidate)
+                combined[key]["recovery_score"] = float(candidate.get("rrf_score") or 0.0)
+            else:
+                target = combined[key]
+                target["recovery_score"] += float(candidate.get("rrf_score") or 0.0)
+                methods = set(target.get("retrieval_methods", [])) | set(candidate.get("retrieval_methods", []))
+                target["retrieval_methods"] = sorted(methods)
+                if float(candidate.get("similarity") or 0) > float(target.get("similarity") or 0):
+                    target["similarity"] = candidate.get("similarity")
+    merged = sorted(combined.values(), key=lambda item: item.get("recovery_score", 0.0), reverse=True)
+    merged = _rerank_candidates(question, merged, top_k, is_self=is_self, user_profile=user_profile)
+    return merged if _retrieval_has_relevant_evidence(merged, question) else []
+
+
+def _no_evidence_followup(question: str) -> str:
+    """Ask for a useful narrowing detail only after dense, sparse, and rewrite retrieval fail."""
+    if re.search(r"\\b(mera|meri|mujhe|batao|dikhao|kya|hai|ka|ki|ke)\\b", question, re.IGNORECASE):
+        return (
+            "Maine available documents mein semantic search, keyword search aur alternate query se bhi "
+            "relevant text verify nahi kar paya. Aap kis uploaded document ya topic ke andar search karwana "
+            "chahte hain? File ka naam ya uska topic bata dein."
+        )
+    return (
+        "I couldn't verify a relevant passage after semantic search, keyword search, and alternate queries. "
+        "Which uploaded document or topic should I focus on? A filename or a few topic keywords will help."
+    )
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 def _ollama_model_available(models: Any, configured_model: str) -> bool:
