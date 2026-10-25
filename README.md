@@ -233,7 +233,7 @@ The target configuration in `.env.example` uses **Gemini Embedding 2 + Qdrant de
 2. **Chunk with structure**. `chunk_text()` uses the configured local tokenizer for bounded chunks, carries Markdown/uppercase section headings into related chunks, and preserves page/slide provenance.
 3. **Embed consistently**. Documents and queries use the configured Gemini model and dimension. The Gemini embedding provider validates vector count, dimensions and finite values, normalizes vectors, bounds retries and does not silently fall back to a different embedding space.
 4. **Index in Qdrant**. Each point holds a named dense vector, a BM25-style sparse vector, text and versioned source/ownership metadata. New document generations are staged as pending, activated only after upload succeeds, then old active points are retired.
-5. **Search and recover**. Dense and sparse candidate ranks are fused with Reciprocal Rank Fusion. Query aliases help exact-fact questions; weak searches can trigger up to two bounded rewrite attempts. A follow-up is returned only after the configured retrieval/recovery pipeline fails to find evidence.
+5. **Search and recover**. Dense and sparse candidate ranks are fused with Reciprocal Rank Fusion. Query aliases help exact-fact questions; weak searches can trigger up to two bounded recovery attempts. If `RAG_QUERY_REWRITE_LLM=true`, Ollama also proposes bounded alternate queries; no incompatible embedding fallback is used. A follow-up is returned only after retrieval/recovery fails.
 6. **Verify permissions and evidence**. Qdrant metadata filters are checked against live PostgreSQL ownership and college membership before chunks reach the answer generator. Answers use retrieved evidence and source labels; missing evidence does not become a fabricated answer.
 
 ### Set up locally
@@ -283,8 +283,12 @@ The script creates `.env` from `.env.example` **only when a local `.env` does no
 | `QDRANT_COLLECTION_NAME` | Versioned collection used for this model/dimension. |
 | `QDRANT_SPARSE_MODEL=Qdrant/bm25` | FastEmbed sparse lexical retrieval model. Its English-oriented stemming means Hindi/Hinglish ranking quality must be measured, not assumed; Gemini dense retrieval and query aliases complement it. |
 | `CHUNK_SIZE_TOKENS` / `CHUNK_OVERLAP_TOKENS` | Starting defaults 450/60. Tune only against a labelled project dataset. |
+| `CHUNKING_VERSION=heading-paragraph-token-v3` | Version attached to indexed chunks. Reindex when chunking behavior changes. |
 | `RAG_CANDIDATE_K=30` | Candidate pool before relevance filtering/reranking. |
-| `QDRANT_MIN_DENSE_SCORE=0.35` | Initial score gate. Calibrate on real relevant and irrelevant examples; this is not a universal threshold. |
+| `QDRANT_MIN_DENSE_SCORE=0.35` | Initial Qdrant score gate. Calibrate on real relevant and irrelevant examples; this is not a universal threshold. |
+| `RAG_ANSWER_MIN_SIMILARITY=0.28` | Initial pgvector answer-evidence gate, distinct from candidate retrieval. Calibrate with labelled queries. |
+| `RAG_QUERY_EMBED_CACHE_SIZE=256` | Bounded in-process query-vector cache; it uses hashed question keys and never logs raw cache keys. Set to `0` to disable. |
+| `RAG_QUERY_REWRITE_LLM=false` | Optional Ollama-based query rewrite after a weak first search. Deterministic English/Hindi/Hinglish lexical aliases still run when disabled. |
 | `RERANK_ENABLED=false` | Optional local cross-encoder reranking; enable only after checking Hindi/Hinglish quality and Mac memory/latency. |
 | `OCR_ENABLED=true`, `OCR_LANG=eng` | Scanned-PDF OCR. On macOS install Tesseract and its language packs; use `eng+hin` only if both are installed. |
 
