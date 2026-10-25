@@ -319,7 +319,7 @@ The script creates `.env` from `.env.example` **only when a local `.env` does no
 ```bash
 cd rag-service
 python -m pip install -r requirements.txt
-python -m py_compile main.py vector_store.py document_parser.py reindex_documents.py evaluate_retrieval.py benchmark_embedding_models.py evaluate_end_to_end.py backup_qdrant.py restore_qdrant.py
+python -m py_compile main.py vector_store.py document_parser.py reindex_documents.py evaluate_retrieval.py benchmark_embedding_models.py evaluate_end_to_end.py backup_qdrant.py restore_qdrant.py benchmark_chunking.py
 pytest -q
 ```
 
@@ -338,6 +338,17 @@ python rag-service/benchmark_embedding_models.py \
 ```
 
 The sample set is synthetic; it is a harness check only, not evidence that either model is more accurate for your private documents. Use manually labelled, consented, redacted data for model selection. The report measures dense-only Recall@5/10, MRR@10, nDCG@10, embedding latency and request counts. Actual billing should be checked in the provider's usage dashboard.
+
+Benchmark chunk size/overlap against your local original corpus without embedding API calls or index writes:
+
+```bash
+python rag-service/benchmark_chunking.py \
+  --source-dir backend/uploads \
+  --configs 250:30 350:50 450:60 600:80 \
+  --output rag-service/evaluation/latest-chunking-report.json
+```
+
+This reports chunk counts, approximate token lengths, source-token coverage, token-size overflow and whether exact phone/email/identifier/date spans remain intact within a single chunk. These are chunking diagnostics—not retrieval accuracy—so choose a few candidate configs and verify them again using the labelled retrieval benchmark before reindexing.
 
 For end-to-end answer/citation/refusal checks, create a private JSONL dataset with real user IDs (do **not** commit it or its report if it contains sensitive data), then run:
 
