@@ -19,3 +19,4 @@ unstructured[docx,pptx,html]>=0.16.0
 beautifulsoup4>=4.12.3
 python-pptx>=1.0.2
 tiktoken>=0.9.0
+python-dotenv>=1.0.1
