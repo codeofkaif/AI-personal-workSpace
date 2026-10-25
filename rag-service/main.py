@@ -1095,22 +1095,40 @@ def understand_query(question: str, conversation_history: List[ConversationTurn]
 
 
 
-def _retrieval_has_relevant_evidence(candidates: List[Dict[str, Any]], question: str) -> bool:
-    """Gate answer generation on evidence scores calibrated for the configured backend."""
-    if not candidates:
-        return False
+def _filter_relevant_evidence(
+    candidates: List[Dict[str, Any]],
+    question: str,
+) -> List[Dict[str, Any]]:
+    """Remove weak/noisy candidates before generation, keeping exact-fact lexical hits."""
     threshold = (
         float(os.getenv("QDRANT_MIN_DENSE_SCORE", "0.35"))
         if RAG_VECTOR_BACKEND == "qdrant"
         else RAG_SIMILARITY_THRESHOLD
     )
-    if any(float(item.get("similarity") or 0.0) >= threshold for item in candidates):
-        return True
     exact_fact_intent = bool(re.search(
-        r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|email|e-mail|ईमेल|roll|enrollment|student\s*id|cgpa|gpa|date of birth|जन्म तिथि|\bdob\b",
+        r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|"
+        r"email|e-mail|ईमेल|roll|enrollment|student\s*id|cgpa|gpa|date of birth|जन्म तिथि|\bdob\b",
         question, re.IGNORECASE,
     ))
-    return exact_fact_intent and any("keyword" in item.get("retrieval_methods", []) for item in candidates)
+    filtered = []
+    seen = set()
+    for item in candidates:
+        similarity = float(item.get("similarity") or 0.0)
+        methods = item.get("retrieval_methods") or []
+        lexical_fact = exact_fact_intent and "keyword" in methods
+        if similarity < threshold and not lexical_fact:
+            continue
+        identity = str(item.get("id") or item.get("content_hash") or item.get("content", "")[:160])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        filtered.append(item)
+    return filtered
+
+
+def _retrieval_has_relevant_evidence(candidates: List[Dict[str, Any]], question: str) -> bool:
+    """Gate answer generation on the relevance-filtered evidence."""
+    return bool(_filter_relevant_evidence(candidates, question))
 
 
 def _retrieval_query_variants(question: str) -> List[str]:
@@ -1178,8 +1196,12 @@ def retrieve_with_recovery(
         is_self=is_self, user_profile=user_profile,
     )
     groups = [initial]
-    if _retrieval_has_relevant_evidence(initial, question):
-        return initial
+    initial_relevant = _filter_relevant_evidence(initial, question)
+    if initial_relevant:
+        return _rerank_candidates(
+            question, initial_relevant, max(top_k, RAG_CANDIDATE_K),
+            is_self=is_self, user_profile=user_profile,
+        )
 
     logger.info("Retrieval evidence below threshold; running bounded query-rewrite recovery")
     for variant in _retrieval_query_variants(question):
@@ -1211,11 +1233,13 @@ def retrieve_with_recovery(
                     float(candidate.get("similarity") or 0.0),
                 )
     merged = sorted(combined.values(), key=lambda item: item.get("recovery_score", 0.0), reverse=True)
-    merged = _rerank_candidates(
-        question, merged, max(top_k, RAG_CANDIDATE_K),
+    relevant = _filter_relevant_evidence(merged, question)
+    if not relevant:
+        return []
+    return _rerank_candidates(
+        question, relevant, max(top_k, RAG_CANDIDATE_K),
         is_self=is_self, user_profile=user_profile,
     )
-    return merged if _retrieval_has_relevant_evidence(merged, question) else []
 
 
 def _no_evidence_followup(question: str) -> str:
