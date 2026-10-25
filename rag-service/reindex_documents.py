@@ -189,19 +189,26 @@ def main() -> int:
                     continue
 
                 cur.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
-                metadata = {
-                    "filename": title or path.name,
-                    "user_id": user_id,
-                    "document_id": document_id,
-                    "is_college_doc": bool(is_college_doc),
-                    "embedding_model": EMBEDDING_MODEL_NAME,
-                    "chunking_version": CHUNKING_VERSION,
-                    "chunk_size_tokens": CHUNK_SIZE_TOKENS,
-                    "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
-                }
                 import json
-                metadata_json = json.dumps(metadata)
                 for index, ((page_number, content), vector) in enumerate(zip(records, vectors)):
+                    first_line = content.split("\n", 1)[0].strip()
+                    heading = first_line if first_line.startswith("#") else None
+                    metadata = {
+                        "filename": title or path.name,
+                        "user_id": user_id,
+                        "document_id": document_id,
+                        "is_college_doc": bool(is_college_doc),
+                        "embedding_model": EMBEDDING_MODEL_NAME,
+                        "chunking_version": CHUNKING_VERSION,
+                        "chunk_size_tokens": CHUNK_SIZE_TOKENS,
+                        "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
+                        "content_hash": __import__("hashlib").sha256(
+                            " ".join(content.split()).lower().encode("utf-8")
+                        ).hexdigest()[:16],
+                        "heading": heading,
+                        "page_number": page_number,
+                    }
+                    metadata_json = json.dumps(metadata)
                     cur.execute(
                         """INSERT INTO document_chunks
                            (content, metadata, page_number, chunk_index, document_id, embedding, embedding_model)
