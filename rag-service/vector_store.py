@@ -497,9 +497,18 @@ def upsert_document_chunks(items: Sequence[Dict[str, Any]], dense_vectors: Seque
         points=point_ids,
         wait=True,
     )
-    stale = [point_id for point_id in current if point_id not in set(point_ids)]
+    current_ids = set(point_ids)
+    stale = [point_id for point_id in current if point_id not in current_ids]
     if stale:
         client.delete(collection_name=collection, points_selector=stale, wait=True)
+
+    # Retry after a partially failed ingestion can leave pending (never searchable) points.
+    # Remove only pending points for this same document/owner after the new generation is active.
+    pending = _scroll_ids(client, collection, document_key, user_id, status="pending")
+    stale_pending = [point_id for point_id in pending if point_id not in current_ids]
+    if stale_pending:
+        client.delete(collection_name=collection, points_selector=stale_pending, wait=True)
+
     logger.info("Qdrant indexed document_key=%s generation=%s chunks=%s model=%s",
                 document_key, generation_id, len(points), model_name)
     return len(points)
