@@ -1,0 +1,20 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    container_name: ai-workspace-qdrant
+    restart: unless-stopped
+    # Local development only. Do not expose Qdrant publicly without authentication/TLS.
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -q -O - http://127.0.0.1:6333/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  qdrant_storage:
