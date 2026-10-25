@@ -41,6 +41,74 @@ def test_self_reference_uses_word_boundaries():
     assert main.is_self_referential_query("Main kaun hu?", profile)
 
 
+def test_self_referential_detector_handles_contact_facts_in_english_and_hinglish():
+    profile = {"name": "Test User"}
+    assert main.is_self_referential_query("give me my mobile phone number", profile)
+    assert main.is_self_referential_query("Mera mobile number batao", profile)
+    assert main.is_self_referential_query("my email address", profile)
+
+
+def test_personal_contact_question_prioritizes_personal_scope_only_after_authored_intent(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    seen_scopes = []
+    monkeypatch.setattr(main, "RAG_QUERY_CLARIFICATION_ENABLED", False)
+    monkeypatch.setattr(
+        main,
+        "fetch_user_profile",
+        lambda user_id, passed_profile=None: {
+            "id": user_id, "name": "Test User", "role": "STUDENT",
+            "department": "CSE", "college": "Test College", "college_id": 7,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "retrieve_with_recovery",
+        lambda question, user_id, scope, top_k, is_self, user_profile: (
+            seen_scopes.append(scope) or []
+        ),
+    )
+    headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
+    with TestClient(main.app) as client:
+        default_scope = client.post(
+            "/query",
+            json={"question": "give me my mobile phone number", "user_id": 42,
+                  "scope": "College + Personal", "top_k": 5},
+            headers=headers,
+        )
+        explicit_college_scope = client.post(
+            "/query",
+            json={"question": "give me my mobile phone number", "user_id": 42,
+                  "scope": "College Only", "top_k": 5},
+            headers=headers,
+        )
+    assert default_scope.status_code == 200
+    assert explicit_college_scope.status_code == 200
+    assert seen_scopes == ["Personal Only", "College Only"]
+
+
+def test_weak_retrieval_retries_query_variants_before_returning_no_evidence(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "get_embedding", lambda query, is_query=False: [len(query)])
+    monkeypatch.setattr(main, "_retrieval_query_variants", lambda question: ["mobile phone contact number"])
+    def retrieve(question, embedding, user_id, scope, top_k, is_self=False, user_profile=None):
+        calls.append(question)
+        score = 0.01 if len(calls) == 1 else 0.88
+        return [{
+            "id": len(calls), "content": "Mobile number is +91 98765-43210",
+            "filename": "profile.pdf", "similarity": score, "rrf_score": 0.05,
+            "retrieval_methods": ["dense"],
+        }]
+    monkeypatch.setattr(main, "retrieve_context", retrieve)
+    result = main.retrieve_with_recovery(
+        "give me my mobile phone number", 42, "Personal Only", 5,
+        True, {"name": "Test User"},
+    )
+    assert calls == ["give me my mobile phone number", "mobile phone contact number"]
+    assert result
+    assert result[0]["similarity"] == 0.88
+
+
 def test_scope_filter_denies_unauthenticated_user():
     clause, params = main._scope_filter(None, "College + Personal")
     assert clause == "FALSE"
@@ -82,6 +150,86 @@ def test_valid_citation_is_preserved():
     assert main._validate_source_citations(answer, context) == answer
 
 
+def test_factual_extractor_accepts_spaced_and_hyphenated_phone_number():
+    context = [{
+        "filename": "profile.pdf",
+        "content": "Contact details: Mobile Number: +91 98765-43210",
+    }]
+    answer = main._extract_factual_answer(
+        "give me my mobile phone number", context, "Test"
+    )
+    assert answer is not None
+    assert "+91 98765-43210" in answer
+    assert "[Source: profile.pdf]" in answer
+
+
+def test_generic_my_number_keyword_result_passes_exact_fact_evidence_gate(monkeypatch):
+    monkeypatch.setattr(main, "RAG_VECTOR_BACKEND", "qdrant")
+    monkeypatch.setenv("QDRANT_MIN_DENSE_SCORE", "0.35")
+    candidates = [{
+        "id": "point-1",
+        "content": "Mobile Number: +91 98765-43210",
+        "similarity": 0.0,
+        "retrieval_methods": ["keyword"],
+    }]
+    filtered = main._filter_relevant_evidence(candidates, "Give me my number from uploaded document")
+    assert len(filtered) == 1
+
+
+def test_factual_extractor_handles_generic_my_number_from_profile():
+    context = [{
+        "filename": "profile.pdf",
+        "content": "Contact details: Mobile Number: +91 98765 43210; Roll Number: CSE-1048",
+    }]
+    answer = main._extract_factual_answer("Give me my number from uploaded document", context, "Test")
+    assert answer is not None
+    assert "+91 98765 43210" in answer
+
+
+def test_factual_extractor_handles_hindi_date_of_birth_and_roll_number():
+    dob = main._extract_factual_answer(
+        "मेरी जन्म तिथि क्या है?",
+        [{"filename": "Personal.pdf", "content": "जन्म तिथि: 17/03/2004"}],
+        "Test",
+    )
+    roll = main._extract_factual_answer(
+        "मेरा रोल नंबर बताओ",
+        [{"filename": "AdmitCard.pdf", "content": "रोल नंबर: CSE-1048"}],
+        "Test",
+    )
+    assert dob is not None and "17/03/2004" in dob
+    assert roll is not None and "CSE-1048" in roll
+
+
+def test_chunker_keeps_section_headings_with_related_content(monkeypatch):
+    import vector_store
+
+    monkeypatch.setattr(main, "RAG_VECTOR_BACKEND", "qdrant")
+    monkeypatch.setattr(vector_store, "get_text_tokenizer", lambda: None)
+    chunks = main.chunk_text(
+        "## Contact Details\nMobile: +91 98765-43210\n\n## Education\nCGPA: 8.4",
+        chunk_size=64,
+        overlap=8,
+    )
+    assert any("## Contact Details" in chunk and "Mobile: +91 98765-43210" in chunk for chunk in chunks)
+    assert any("## Education" in chunk and "CGPA: 8.4" in chunk for chunk in chunks)
+
+
+def test_long_table_chunks_repeat_the_table_header(monkeypatch):
+    import vector_store
+
+    monkeypatch.setattr(main, "RAG_VECTOR_BACKEND", "qdrant")
+    monkeypatch.setattr(vector_store, "get_text_tokenizer", lambda: None)
+    rows = [
+        f"Person {i} | Mobile contact details for student number {i} and college directory record"
+        for i in range(1, 40)
+    ]
+    table = "TABLE\nName | Contact\n" + "\n".join(rows)
+    chunks = main.chunk_text(table, chunk_size=64, overlap=8)
+    assert len(chunks) > 1
+    assert all(chunk.startswith("TABLE\nName | Contact") for chunk in chunks)
+
+
 class FakeVectorBatch(list):
     def tolist(self):
         return list(self)
@@ -95,6 +243,41 @@ class FakeE5Model:
     def encode(self, texts, **kwargs):
         self.inputs = texts
         return FakeVectorBatch([[1.0] + [0.0] * (main.EMBEDDING_DIMENSION - 1) for _ in texts])
+
+
+def test_query_embedding_cache_reuses_identical_query(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "RAG_QUERY_EMBED_CACHE_SIZE", 2)
+    main._query_embed_cache.clear()
+    def fake_embeddings(texts, is_query=False, titles=None):
+        calls.append((list(texts), is_query))
+        return [[float(len(texts[0]))] * main.EMBEDDING_DIMENSION]
+    monkeypatch.setattr(main, "get_embeddings", fake_embeddings)
+    first = main.get_embedding("same private query", is_query=True)
+    second = main.get_embedding("same private query", is_query=True)
+    assert first == second
+    assert len(calls) == 1
+    main._query_embed_cache.clear()
+
+
+def test_enrich_text_for_index_preserves_original_phone_and_adds_compact_form():
+    source = "Mobile Number: +91 98765-43210"
+    enriched = main.enrich_text_for_index(source)
+    assert source in enriched
+    assert "919876543210" in enriched
+    assert main.compact_digit_runs("98765 43210") == "9876543210"
+
+
+def test_weak_search_uses_aliases_without_llm_rewrite_by_default(monkeypatch):
+    monkeypatch.setattr(main, "RAG_QUERY_REWRITE_LLM", False)
+    monkeypatch.setattr(
+        main,
+        "_call_ollama",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Ollama rewrite is disabled")),
+    )
+    variants = main._retrieval_query_variants("What is my mobile number?")
+    assert variants
+    assert "mobile phone" in variants[0].lower()
 
 
 def test_e5_uses_query_and_passage_prefixes(monkeypatch):
@@ -374,24 +557,30 @@ def test_conversation_history_is_bounded_to_most_recent_eight_turns():
     assert normalized[-1]["content"] == "Question 9"
 
 
-def test_vague_query_retrieves_before_asking_followup(monkeypatch):
+def test_unclear_query_asks_followup_only_after_retrieval_recovery(monkeypatch):
     from fastapi.testclient import TestClient
 
-    retrieve_calls = {"n": 0}
+    calls = {"retrieval": 0}
 
-    def fake_retrieve(*args, **kwargs):
-        retrieve_calls["n"] += 1
+    monkeypatch.setattr(main, "RAG_QUERY_CLARIFICATION_ENABLED", False)
+    monkeypatch.setattr(
+        main,
+        "fetch_user_profile",
+        lambda user_id, passed_profile=None: {
+            "id": user_id, "name": "Test User", "role": "STUDENT",
+            "department": "CSE", "college": "Test College", "college_id": 7,
+        },
+    )
+
+    def exhausted_retrieval(*args, **kwargs):
+        calls["retrieval"] += 1
         return []
 
-    def forbidden_generate(*args, **kwargs):
-        raise AssertionError("Do not generate an answer before the retrieval pipeline finishes")
+    def forbidden_generation(*args, **kwargs):
+        raise AssertionError("No answer may be generated without retrieved evidence")
 
-    monkeypatch.setattr(main, "fetch_user_profile", lambda user_id, passed_profile=None: {
-        "id": user_id, "name": "Test User", "role": "STUDENT", "college": "Test", "department": "CSE",
-    })
-    monkeypatch.setattr(main, "get_embedding", lambda text, is_query=False: [0.0] * main.EMBEDDING_DIMENSION)
-    monkeypatch.setattr(main, "retrieve_context", fake_retrieve)
-    monkeypatch.setattr(main, "generate_answer", forbidden_generate)
+    monkeypatch.setattr(main, "retrieve_with_recovery", exhausted_retrieval)
+    monkeypatch.setattr(main, "generate_answer", forbidden_generation)
     headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
 
     with TestClient(main.app) as client:
@@ -402,11 +591,11 @@ def test_vague_query_retrieves_before_asking_followup(monkeypatch):
         )
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert retrieve_calls["n"] >= 1
+    assert calls["retrieval"] == 1
     assert payload["clarification_needed"] is True
     assert payload["sources"] == []
     assert payload["chunks_used"] == 0
-    assert payload["answer"]
+    assert "uploaded document" in payload["answer"]
 
 
 def test_pending_clarification_combines_original_request_and_reply(monkeypatch):
@@ -456,13 +645,18 @@ def test_classifier_can_normalize_a_typo_before_retrieval(monkeypatch):
     assert result["normalized_query"] == "Explain dependency injection in Spring Boot"
 
 
-def test_ambiguous_short_query_does_not_clarify_before_retrieval():
-    result = main.understand_query("Explain this", [])
+def test_ambiguous_short_query_still_reaches_retrieval(monkeypatch):
+    monkeypatch.setattr(
+        main, "_classify_query_clarity",
+        lambda question, history: {
+            "action": "clarify",
+            "normalized_query": None,
+            "clarification_question": "Do you mean the Spring Framework in Java or the spring season?",
+        },
+    )
+    result = main.understand_query("Explain Spring", [])
     assert result["action"] == "answer"
-    assert "Explain this" in result["normalized_query"]
-    followup = main.followup_after_failed_retrieval("Explain this", [])
-    assert followup
-    assert main.followup_after_failed_retrieval("Explain Java collections framework iterators", []) is None
+    assert result["normalized_query"] == "Explain Spring"
 
 
 def test_clear_short_query_proceeds_when_classifier_confirms_intent(monkeypatch):

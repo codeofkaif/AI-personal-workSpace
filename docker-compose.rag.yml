@@ -1,0 +1,14 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    container_name: ai-workspace-qdrant
+    restart: unless-stopped
+    # Local development only. Never expose an unauthenticated Qdrant instance publicly.
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:

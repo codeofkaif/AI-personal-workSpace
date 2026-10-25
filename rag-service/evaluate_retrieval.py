@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import statistics
 import sys
 import time
@@ -22,12 +21,7 @@ from pathlib import Path
 SERVICE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SERVICE_DIR))
 
-from main import (  # noqa: E402
-    EMBEDDING_MODEL_NAME,
-    compact_digit_runs,
-    get_embedding,
-    retrieve_context,
-)
+from main import EMBEDDING_MODEL_NAME, fetch_user_profile, retrieve_with_recovery  # noqa: E402
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
@@ -38,40 +32,7 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[index], 4)
 
 
-FACT_TOKEN_RE = re.compile(
-    r"[\w.+-]+@[\w.-]+\.\w+|(?:\+91[\s-]*)?[6-9](?:[\s-]*\d){9}|\b\d+(?:\.\d+)?\b"
-)
-
-
-def recall_at_k(retrieved_ids: list[int], relevant_ids: set[int], k: int) -> float:
-    if not relevant_ids:
-        return 0.0
-    hits = sum(1 for chunk_id in retrieved_ids[:k] if chunk_id in relevant_ids)
-    return hits / len(relevant_ids)
-
-
-def mrr_at_k(retrieved_ids: list[int], relevant_ids: set[int], k: int) -> float:
-    for rank, chunk_id in enumerate(retrieved_ids[:k], start=1):
-        if chunk_id in relevant_ids:
-            return 1.0 / rank
-    return 0.0
-
-
-def answer_faithfulness(answer: str, contexts: list[str]) -> float:
-    """Share of numeric/contact facts in the answer that also appear in retrieved context."""
-    facts = FACT_TOKEN_RE.findall(answer or "")
-    blob = compact_digit_runs(" ".join(contexts or []).lower())
-    if not facts:
-        return 1.0 if blob.strip() else 0.0
-    hits = 0
-    for fact in facts:
-        needle = compact_digit_runs(fact).lower()
-        if needle and needle in blob:
-            hits += 1
-    return hits / len(facts)
-
-
-def ndcg_at_k(retrieved_ids: list[int], relevant_ids: set[int], k: int) -> float:
+def ndcg_at_k(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> float:
     if not relevant_ids:
         return 0.0
     dcg = sum(1.0 / math.log2(rank + 1) for rank, chunk_id in enumerate(retrieved_ids[:k], start=1)
@@ -115,35 +76,45 @@ def main() -> int:
 
     latencies = []
     recall5 = []
+    recall10 = []
     mrr10 = []
     ndcg5 = []
     scored = 0
     details = []
     for index, row in enumerate(rows, start=1):
         started = time.perf_counter()
-        vector = get_embedding(row["question"], is_query=True)
-        contexts = retrieve_context(
-            row["question"], vector, row["user_id"],
-            row.get("scope", "College + Personal"), args.top_k
+        profile = fetch_user_profile(row["user_id"])
+        contexts = retrieve_with_recovery(
+            row["question"],
+            row["user_id"],
+            row.get("scope", "College + Personal"),
+            args.top_k,
+            is_self=False,
+            user_profile=profile,
         )
         elapsed = time.perf_counter() - started
         latencies.append(elapsed)
-        ids = [int(item["id"]) for item in contexts if item.get("id") is not None]
-        relevant = {int(value) for value in row.get("relevant_chunk_ids", [])}
+        ids = [str(item["id"]) for item in contexts if item.get("id") is not None][:args.top_k]
+        relevant = {str(value) for value in row.get("relevant_chunk_ids", [])}
         detail = {
             "index": index,
             "question": row["question"],
             "elapsed_seconds": round(elapsed, 4),
             "retrieved_chunk_ids": ids,
-            "source_files": list(dict.fromkeys(item.get("filename", "Document") for item in contexts)),
+            "source_files": list(dict.fromkeys(item.get("filename", "Document") for item in contexts[:args.top_k])),
         }
         if relevant:
             scored += 1
-            recall5.append(recall_at_k(ids, relevant, 5))
-            mrr10.append(mrr_at_k(ids, relevant, 10))
+            hits5 = sum(1 for chunk_id in ids[:5] if chunk_id in relevant)
+            recall5.append(hits5 / len(relevant))
+            hits10 = sum(1 for chunk_id in ids[:10] if chunk_id in relevant)
+            recall10.append(hits10 / len(relevant))
+            positions = [rank for rank, chunk_id in enumerate(ids[:10], start=1) if chunk_id in relevant]
+            mrr10.append(1.0 / positions[0] if positions else 0.0)
             ndcg5.append(ndcg_at_k(ids, relevant, 5))
             detail["relevant_chunk_ids"] = sorted(relevant)
             detail["recall_at_5"] = round(recall5[-1], 4)
+            detail["recall_at_10"] = round(recall10[-1], 4)
             detail["mrr_at_10"] = round(mrr10[-1], 4)
             detail["ndcg_at_5"] = round(ndcg5[-1], 4)
         details.append(detail)
@@ -160,6 +131,7 @@ def main() -> int:
         },
         "metrics": {
             "recall_at_5": round(statistics.mean(recall5), 4) if recall5 else None,
+            "recall_at_10": round(statistics.mean(recall10), 4) if recall10 else None,
             "mrr_at_10": round(statistics.mean(mrr10), 4) if mrr10 else None,
             "ndcg_at_5": round(statistics.mean(ndcg5), 4) if ndcg5 else None,
         },

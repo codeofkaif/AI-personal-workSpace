@@ -23,11 +23,15 @@ sys.path.insert(0, str(SERVICE_DIR))
 
 from main import (  # noqa: E402
     EMBEDDING_MODEL_NAME,
+    RAG_VECTOR_BACKEND,
     CHUNK_SIZE_TOKENS,
     CHUNK_OVERLAP_TOKENS,
+    CHUNKING_VERSION,
+    content_fingerprint,
     chunk_text,
     ensure_chunk_schema,
     extract_pages_from_file,
+    enrich_text_for_index,
     get_db_connection,
     get_embeddings,
     logger,
@@ -41,7 +45,12 @@ def resolve_document_path(file_url: str, upload_dir: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true", help="Compute chunks/embeddings, do not change DB rows")
+    parser.add_argument("--dry-run", action="store_true", help="Validate source parsing/chunking without modifying indexes or calling Gemini")
+    parser.add_argument(
+        "--verify-embeddings",
+        action="store_true",
+        help="Explicitly call the configured embedding provider during --dry-run (requires API credentials)",
+    )
     parser.add_argument(
         "--upload-dir",
         default=os.getenv("DOCUMENT_UPLOAD_DIR", str(ROOT_DIR / "backend" / "uploads")),
@@ -63,21 +72,23 @@ def main() -> int:
     failed = 0
     try:
         # A dry run must not alter schema or chunk metadata.
-        if not args.dry_run:
+        if not args.dry_run and RAG_VECTOR_BACKEND == "pgvector":
             ensure_chunk_schema(conn)
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, title, file_url, user_id, is_college_doc
-            FROM documents
-            ORDER BY id
+            SELECT d.id, d.title, d.file_url, d.user_id, d.is_college_doc,
+                   COALESCE(d.college_id, u.college_id) AS college_id
+            FROM documents d
+            LEFT JOIN users u ON u.id = d.user_id
+            ORDER BY d.id
         """)
         documents = cur.fetchall()
         cur.close()
         print(f"Embedding model: {EMBEDDING_MODEL_NAME}")
-        print(f"Chunk strategy: paragraph/token v2, target={CHUNK_SIZE_TOKENS}, overlap={CHUNK_OVERLAP_TOKENS}")
+        print(f"Chunk strategy: heading-paragraph-token-v3, target={CHUNK_SIZE_TOKENS}, overlap={CHUNK_OVERLAP_TOKENS}")
         print(f"Documents discovered: {len(documents)}; dry_run={args.dry_run}")
 
-        for document_id, title, file_url, user_id, is_college_doc in documents:
+        for document_id, title, file_url, user_id, is_college_doc, college_id in documents:
             if not file_url:
                 skipped += 1
                 print(f"SKIP id={document_id} title={title!r}: no stored file_url")
@@ -90,37 +101,113 @@ def main() -> int:
 
             try:
                 file_bytes = path.read_bytes()
-                pages = [(page, text) for page, text in extract_pages_from_file(file_bytes, title or path.name) if text.strip()]
+                pages = [
+                    (page, enrich_text_for_index(text))
+                    for page, text in extract_pages_from_file(file_bytes, title or path.name)
+                    if text.strip()
+                ]
                 records = [(page, chunk) for page, text in pages for chunk in chunk_text(text)]
                 if not records:
                     skipped += 1
                     print(f"SKIP id={document_id} title={title!r}: no readable text (scanned PDFs need OCR)")
                     continue
-                vectors = get_embeddings([chunk for _, chunk in records])
+                chunk_texts = [chunk for _, chunk in records]
+                if args.dry_run and not args.verify_embeddings:
+                    succeeded += 1
+                    print(
+                        f"DRY-RUN id={document_id} title={title!r}: "
+                        f"{len(records)} chunks validated; embeddings skipped"
+                    )
+                    continue
+                if RAG_VECTOR_BACKEND == "qdrant":
+                    vectors = get_embeddings(chunk_texts, titles=[title or path.name] * len(chunk_texts))
+                else:
+                    vectors = get_embeddings(chunk_texts)
                 if args.dry_run:
                     succeeded += 1
-                    print(f"DRY-RUN id={document_id} title={title!r}: {len(records)} chunks validated")
+                    print(
+                        f"DRY-RUN id={document_id} title={title!r}: "
+                        f"{len(records)} chunks and embeddings validated"
+                    )
                     continue
 
                 cur = conn.cursor()
-                # Each document is replaced atomically; the previous index remains if inserting fails.
-                cur.execute("SELECT id FROM documents WHERE id = %s FOR UPDATE", (document_id,))
-                if cur.fetchone() is None:
+                # Verify the source row still exists and is stable before replacing the index.
+                cur.execute(
+                    """
+                    SELECT d.user_id, d.is_college_doc,
+                           COALESCE(d.college_id, u.college_id) AS college_id
+                    FROM documents d
+                    LEFT JOIN users u ON u.id = d.user_id
+                    WHERE d.id = %s
+                    FOR UPDATE OF d
+                    """,
+                    (document_id,),
+                )
+                current_metadata = cur.fetchone()
+                if current_metadata is None:
                     raise RuntimeError("document record disappeared during reindex")
+                current_user_id, current_college_scope, current_college_id = current_metadata
+                if (
+                    int(current_user_id) != int(user_id)
+                    or bool(current_college_scope) != bool(is_college_doc)
+                    or (
+                        current_college_id is not None and college_id is not None
+                        and int(current_college_id) != int(college_id)
+                    )
+                ):
+                    raise RuntimeError(
+                        "document owner/college scope changed while embeddings were being computed; "
+                        "retry the reindex after reviewing document metadata"
+                    )
+                user_id = int(current_user_id)
+                is_college_doc = bool(current_college_scope)
+                college_id = current_college_id
+
+                if RAG_VECTOR_BACKEND == "qdrant":
+                    from vector_store import upsert_document_chunks
+                    if bool(is_college_doc) and college_id is None:
+                        raise RuntimeError("college-scoped document has no verified college_id")
+                    items = [
+                        {
+                            "content": content,
+                            "filename": title or path.name,
+                            "user_id": int(user_id),
+                            "document_id": int(document_id),
+                            "document_key": f"document:{document_id}",
+                            "is_college_doc": bool(is_college_doc),
+                            "college_id": int(college_id) if college_id is not None and bool(is_college_doc) else None,
+                            "page_number": page_number,
+                            "chunk_index": index,
+                        }
+                        for index, (page_number, content) in enumerate(records)
+                    ]
+                    upsert_document_chunks(items, vectors)
+                    conn.commit()
+                    cur.close()
+                    succeeded += 1
+                    print(f"OK id={document_id} title={title!r}: {len(records)} Qdrant chunks")
+                    continue
+
                 cur.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
-                metadata = {
-                    "filename": title or path.name,
-                    "user_id": user_id,
-                    "document_id": document_id,
-                    "is_college_doc": bool(is_college_doc),
-                    "embedding_model": EMBEDDING_MODEL_NAME,
-                    "chunking_version": "paragraph-token-v2",
-                    "chunk_size_tokens": CHUNK_SIZE_TOKENS,
-                    "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
-                }
                 import json
-                metadata_json = json.dumps(metadata)
                 for index, ((page_number, content), vector) in enumerate(zip(records, vectors)):
+                    first_line = content.split("\n", 1)[0].strip()
+                    heading = first_line if first_line.startswith("#") else None
+                    metadata = {
+                        "filename": title or path.name,
+                        "user_id": user_id,
+                        "document_id": document_id,
+                        "is_college_doc": bool(is_college_doc),
+                        "embedding_model": EMBEDDING_MODEL_NAME,
+                        "chunking_version": CHUNKING_VERSION,
+                        "chunk_size_tokens": CHUNK_SIZE_TOKENS,
+                        "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
+                        "content_hash": content_fingerprint(content),
+                        "heading": heading,
+                        "page_number": page_number,
+                    }
+                    metadata_json = json.dumps(metadata)
                     cur.execute(
                         """INSERT INTO document_chunks
                            (content, metadata, page_number, chunk_index, document_id, embedding, embedding_model)
@@ -140,7 +227,7 @@ def main() -> int:
         print(f"\nSummary: succeeded={succeeded}, skipped={skipped}, failed={failed}")
         if args.dry_run:
             print("Dry run only: the database index was not modified.")
-        return 1 if failed else 0
+        return 1 if failed or skipped else 0
     finally:
         conn.close()
 

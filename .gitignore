@@ -15,6 +15,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+!.env.*.example
 
 # --- Database Backups ---
 backups/
@@ -49,6 +50,9 @@ backend/src/main/resources/application.properties
 
 # --- Python & FastAPI (RAG Service) ---
 rag-service/evaluation/latest-report.json
+rag-service/evaluation/latest-embedding-report.json
+rag-service/evaluation/latest-e2e-report.json
+rag-service/evaluation/latest-chunking-report.json
 __pycache__/
 **/__pycache__/
 *.py[cod]
