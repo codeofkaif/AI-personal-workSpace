@@ -403,8 +403,15 @@ def qdrant_health() -> Dict[str, Any]:
     if present:
         info = client.get_collection(collection_name=collection)
         configured = info.config.params.vectors
-        dense = configured.get("dense") if isinstance(configured, dict) else configured
-        present = dense is not None and getattr(dense, "size", None) == dimension
+        dense = configured.get("dense") if isinstance(configured, dict) else None
+        sparse = info.config.params.sparse_vectors
+        present = (
+            isinstance(configured, dict)
+            and dense is not None
+            and getattr(dense, "size", None) == dimension
+            and isinstance(sparse, dict)
+            and "sparse" in sparse
+        )
     return {"available": True, "collection_exists": present, "collection": collection,
             "embedding_model": model, "dimension": dimension}
 
