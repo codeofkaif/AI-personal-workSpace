@@ -504,11 +504,20 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
     candidate_k = max(top_k, min(100, int(os.getenv("RAG_CANDIDATE_K", "30"))))
     sparse_question = question
     exact_patterns = (
-        (r"phone|mobile|contact|whatsapp|telephone", "phone mobile contact telephone whatsapp number"),
-        (r"email|e-mail|mail address", "email e-mail mail address contact"),
-        (r"roll|enrollment|student\\s*id", "roll number enrollment number student id"),
-        (r"cgpa|gpa", "CGPA GPA grade point average"),
-        (r"date of birth|\\bdob\\b", "date of birth DOB birth date"),
+        (
+            r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप",
+            "phone mobile contact telephone whatsapp number मोबाइल फोन नंबर संपर्क नंबर",
+        ),
+        (
+            r"email|e-mail|mail address|ईमेल|मेल पता",
+            "email e-mail mail address contact ईमेल मेल पता",
+        ),
+        (
+            r"roll|enrollment|student\s*id|रोल नंबर|नामांकन संख्या",
+            "roll number enrollment number student id रोल नंबर नामांकन संख्या",
+        ),
+        (r"cgpa|gpa|अंक", "CGPA GPA grade point average अंक"),
+        (r"date of birth|\bdob\b|जन्म तिथि", "date of birth DOB birth date जन्म तिथि"),
     )
     import re
     for pattern, aliases in exact_patterns:
@@ -581,7 +590,7 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
         # A sparse-only hit is retained only for exact-fact intents or when the
         # query has meaningful lexical overlap. Common stopwords cannot make a chunk relevant.
         exact_fact_intent = bool(re.search(
-            r"phone|mobile|contact|whatsapp|telephone|email|e-mail|roll|enrollment|student\\s*id|cgpa|gpa|date of birth|\\bdob\\b",
+            r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|email|e-mail|ईमेल|roll|enrollment|student\s*id|cgpa|gpa|date of birth|जन्म तिथि|\bdob\b",
             question, re.IGNORECASE,
         ))
         stopwords = {
@@ -592,7 +601,7 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
             "documents", "file", "files",
         }
         query_terms = {
-            token for token in re.findall(r"[\\w@.+-]+", sparse_question.lower())
+            token for token in re.findall(r"[\w@.+-]+", sparse_question.lower())
             if len(token) > 1 and token not in stopwords
         }
         def sparse_overlap(item):
