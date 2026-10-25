@@ -1144,7 +1144,8 @@ def _retrieval_query_variants(question: str) -> List[str]:
          "email e-mail contact address ईमेल मेल पता"),
         (r"roll|enrollment|student\s*id", "roll number enrollment number student ID"),
         (r"cgpa|gpa", "CGPA GPA grade point average"),
-        (r"date of birth|\bdob\b", "date of birth birth date DOB"),
+        (r"date of birth|\bdob\b|जन्म\s*तिथि|janm\s*tithi", "date of birth birth date DOB जन्म तिथि"),
+        (r"\b(my|mera|meri|mere)\b.{0,25}\bnumber\b", "my mobile phone contact number phone number mobile number"),
         (r"\b(mera|meri|mere|mujhe|batao|dikhao)\b", "my personal uploaded document details"),
     )
     for pattern, aliases in rules:
@@ -1937,9 +1938,15 @@ def _source_fallback(context_items: List[Dict[str, Any]], reason: str) -> str:
 # ---------------------------------------------------------------------------
 _FACTUAL_PATTERNS = [
     # Roll / enrollment number (Indian college patterns)
-    (r"roll\s*(?:no|number|num|#)",
-     r"(?:roll\s*(?:no|number|num|#)[:\s.-]*)(\S+)",
+    (r"(?:roll\s*(?:no|number|num|#)|रोल\s*(?:नंबर|नं\.?))",
+     r"(?:roll\s*(?:no|number|num|#)|रोल\s*(?:नंबर|नं\.?))[:\s.-]*(\S+)",
      "Roll Number"),
+    (r"(?:नामांकन\s*(?:संख्या|नंबर)|enrollment\s*(?:no|number|num|#))",
+     r"(?:नामांकन\s*(?:संख्या|नंबर)|enrollment\s*(?:no|number|num|#))[:\s.-]*(\S+)",
+     "Enrollment Number"),
+    (r"(?:छात्र\s*(?:आईडी|आइडी)|student\s*id)",
+     r"(?:छात्र\s*(?:आईडी|आइडी)|student\s*id)[:\s.-]*(\S+)",
+     "Student ID"),
     (r"enrollment\s*(?:no|number|num|#)",
      r"(?:enrollment\s*(?:no|number|num|#)[:\s.-]*)(\S+)",
      "Enrollment Number"),
@@ -1951,16 +1958,16 @@ _FACTUAL_PATTERNS = [
      r"([\w.+-]+@[\w-]+\.[\w.-]+)",
      "Email"),
     # Phone, including Hindi questions (the source value is preserved verbatim)
-    (r"(?:phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप)",
+    (r"(?:phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|(?:my|mera|meri|mere)\s+(?:phone\s+)?number)",
      r"(?:(?:\+91[\s-]?)?[6-9](?:[\s-]?\d){9})",
      "Phone"),
     # CGPA / GPA
-    (r"cgpa|gpa",
-     r"(?:cgpa|gpa)[:\s]*([\d.]+)",
+    (r"(?:cgpa|gpa|सीजीपीए|जीपीए)",
+     r"(?:cgpa|gpa|सीजीपीए|जीपीए)[:\s]*([\d.]+)",
      "CGPA"),
-    # Date of Birth
-    (r"(?:dob|date\s*of\s*birth|born)",
-     r"(?:dob|date\s*of\s*birth|born)[:\s]*([\d]{1,2}[/-][\d]{1,2}[/-][\d]{2,4}|[\d]{4}-[\d]{2}-[\d]{2})",
+    # Date of Birth in numeric formats, including Hindi date labels.
+    (r"(?:dob|date\s*of\s*birth|born|जन्म\s*तिथि|जन्म\s*दिन|janm\s*tithi|janam\s*tithi)",
+     r"(?:dob|date\s*of\s*birth|born|जन्म\s*तिथि|जन्म\s*दिन|janm\s*tithi|janam\s*tithi)[:\s.-]*([\d]{1,2}[/-][\d]{1,2}[/-][\d]{2,4}|[\d]{4}-[\d]{2}-[\d]{2})",
      "Date of Birth"),
 ]
 
