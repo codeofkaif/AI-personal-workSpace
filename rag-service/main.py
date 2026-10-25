@@ -198,15 +198,16 @@ def get_db_connection():
             connect_timeout=max(1, int(os.getenv("DB_CONNECT_TIMEOUT_SEC", "5"))),
             application_name="ai-personal-workspace-rag",
         )
-        from pgvector.psycopg2 import register_vector
-        try:
-            register_vector(conn)
-        except Exception:
-            # First-time setup only: create the extension if DB initialization was missed.
-            with conn.cursor() as cursor:
-                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            conn.commit()
-            register_vector(conn)
+        if RAG_VECTOR_BACKEND == "pgvector":
+            from pgvector.psycopg2 import register_vector
+            try:
+                register_vector(conn)
+            except Exception:
+                # Legacy backend only: create the extension if database initialization was missed.
+                with conn.cursor() as cursor:
+                    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                conn.commit()
+                register_vector(conn)
         return conn
     except Exception as e:
         if conn is not None:
@@ -244,7 +245,7 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT u.name, u.email, u.role, u.department, u.roll_number, u.cgpa, c.name as college_name
+                SELECT u.name, u.email, u.role, u.department, u.roll_number, u.cgpa, c.name as college_name, u.college_id
                 FROM users u
                 LEFT JOIN colleges c ON u.college_id = c.id
                 WHERE u.id = %s
@@ -259,6 +260,7 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
                 profile["cgpa"] = float(row[5]) if row[5] is not None else None
                 if row[6]:
                     profile["college"] = row[6]
+                profile["college_id"] = int(row[7]) if row[7] is not None else None
 
             # Resume status is factual; do not infer a numeric placement score from activity counts.
             cur.execute("""
@@ -582,6 +584,35 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
                      scope: str, top_k: int, is_self: bool = False,
                      user_profile: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Retrieve dense and lexical candidates; fuse rankings with Reciprocal Rank Fusion."""
+    if RAG_VECTOR_BACKEND == "qdrant":
+        if not user_id:
+            return []
+        try:
+            from vector_store import retrieve_hybrid
+            raw_college_id = (user_profile or {}).get("college_id")
+            try:
+                college_id = int(raw_college_id) if raw_college_id is not None else None
+            except (TypeError, ValueError):
+                college_id = None
+            candidates = retrieve_hybrid(
+                question=question,
+                dense_query=question_embedding,
+                user_id=user_id,
+                scope=scope,
+                college_id=college_id,
+                top_k=max(top_k, RAG_CANDIDATE_K),
+                is_self=is_self,
+            )
+            reranked = _rerank_candidates(
+                question, candidates, top_k, is_self=is_self, user_profile=user_profile
+            )
+            for item in reranked:
+                item["filename"] = item.get("filename") or item.get("metadata", {}).get("filename") or "Document"
+            return reranked
+        except Exception as exc:
+            logger.exception("Gemini/Qdrant retrieval failed")
+            raise HTTPException(status_code=503, detail="Qdrant retrieval is unavailable; no answer was generated.") from exc
+
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=503, detail="RAG database is unavailable.")
@@ -1406,7 +1437,11 @@ def select_context_items(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any
     if not candidates:
         return []
     try:
-        tokenizer = getattr(get_model(), "tokenizer", None)
+        if RAG_VECTOR_BACKEND == "qdrant":
+            from vector_store import get_text_tokenizer
+            tokenizer = get_text_tokenizer()
+        else:
+            tokenizer = getattr(get_model(), "tokenizer", None)
     except Exception:
         tokenizer = None
 
@@ -1485,7 +1520,7 @@ _FACTUAL_PATTERNS = [
      "Email"),
     # Phone
     (r"(?:phone|mobile|contact|whatsapp)",
-     r"(?:(?:\+91[\s-]?)?[6-9]\d{9})",
+     r"(?:(?:\+91[\s-]?)?[6-9](?:[\s-]?\d){9})",
      "Phone"),
     # CGPA / GPA
     (r"cgpa|gpa",
