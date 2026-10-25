@@ -604,6 +604,73 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
                 top_k=max(top_k, RAG_CANDIDATE_K),
                 is_self=is_self,
             )
+
+            # Qdrant payloads are a fast filter, not the permission source of truth.
+            # Verify live document ownership/college membership in PostgreSQL before
+            # allowing any stored text to reach the answer model.
+            linked_ids = sorted({
+                int(item["document_id"])
+                for item in candidates
+                if item.get("document_id") is not None
+            })
+            allowed_linked_ids = set()
+            if linked_ids:
+                metadata_conn = get_db_connection()
+                if metadata_conn is None:
+                    raise HTTPException(status_code=503, detail="Could not verify document permissions.")
+                try:
+                    meta_cur = metadata_conn.cursor()
+                    meta_cur.execute(
+                        """
+                        SELECT d.id, d.user_id, COALESCE(d.is_college_doc, FALSE),
+                               COALESCE(d.college_id, owner.college_id) AS doc_college_id,
+                               (SELECT current_user.college_id FROM users current_user WHERE current_user.id = %s)
+                                   AS requester_college_id
+                        FROM documents d
+                        LEFT JOIN users owner ON owner.id = d.user_id
+                        WHERE d.id = ANY(%s)
+                        """,
+                        (int(user_id), linked_ids),
+                    )
+                    for row in meta_cur.fetchall():
+                        doc_id, owner_id, is_college_doc, doc_college_id, requester_college_id = row
+                        personal_allowed = int(owner_id) == int(user_id) and not bool(is_college_doc)
+                        college_allowed = (
+                            bool(is_college_doc)
+                            and doc_college_id is not None
+                            and requester_college_id is not None
+                            and int(doc_college_id) == int(requester_college_id)
+                        )
+                        if (
+                            scope == "Personal Only" and personal_allowed
+                            or scope == "College Only" and college_allowed
+                            or scope == "College + Personal" and (personal_allowed or college_allowed)
+                        ):
+                            allowed_linked_ids.add(int(doc_id))
+                    meta_cur.close()
+                finally:
+                    metadata_conn.close()
+
+            verified = []
+            for item in candidates:
+                document_id_value = item.get("document_id")
+                if document_id_value is None:
+                    # Direct RAG uploads without a documents table row are private-only
+                    # and accepted only when their stored owner matches the caller.
+                    metadata = item.get("metadata") or {}
+                    try:
+                        direct_owner = int(metadata.get("user_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    if scope != "College Only" and direct_owner == int(user_id) and not item.get("is_college_doc"):
+                        verified.append(item)
+                else:
+                    try:
+                        if int(document_id_value) in allowed_linked_ids:
+                            verified.append(item)
+                    except (TypeError, ValueError):
+                        continue
+            candidates = verified
             reranked = _rerank_candidates(
                 question, candidates, max(top_k, RAG_CANDIDATE_K),
                 is_self=is_self, user_profile=user_profile
