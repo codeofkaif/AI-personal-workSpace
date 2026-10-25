@@ -309,7 +309,9 @@ def is_self_referential_query(q: str, profile: Dict[str, Any]) -> bool:
 
     direct_patterns = [
         r"\b(for\s+me|about\s+me|about\s+myself|who\s+am\s+i|who\s+i\s+am|what\s+about\s+me|tell\s+me\s+about\s+me|tell\s+me\s+about\s+myself|details\s+of\s+me|details\s+for\s+me|what\s+do\s+you\s+know\s+about\s+me|introduce\s+me|whoami)\b",
-        r"\b(my|mine)\s+(profile|role|resume|cv|skills?|tech\s+stack|projects?|experience|work|education|qualifications?|degree|background|bio|details?|info|information|achievements?|certifications?|certificates?|strengths?|score|cgpa|marks|placement|scholarship|fees|timetable|attendance|roll(?:\s+number)?|department|branch|college|university|name|contact|email|phone|uploads?|documents?)\b",
+        r"\b(my|mine)\s+(profile|role|resume|cv|skills?|tech\s+stack|projects?|experience|work|education|qualifications?|degree|background|bio|details?|info|information|achievements?|certifications?|certificates?|strengths?|score|cgpa|marks|placement|scholarship|fees|timetable|attendance|roll(?:\s+number)?|department|branch|college|university|name|contact|email|phone|mobile|whatsapp|uploads?|documents?)\b",
+        r"\b(my|mine)\s+(?:mobile\s+)?(?:phone|number|contact|email|e-mail|whatsapp|roll\s*(?:no|number)|student\s*id|date\s+of\s+birth|dob)\b",
+        r"\b(mera|meri|mere)\s+(?:mobile|phone|number|contact|email|e-mail|whatsapp|roll\s*(?:no|number)|student\s*id|janam\s+din|janm\s+tithi)\b",
         r"\b(what|which)\s+(skills?|projects?|documents?|files?)\s+(do\s+i|have\s+i|did\s+i)\b",
         r"\b(what\s+have\s+i\s+done|what\s+did\s+i\s+upload|what\s+documents?\s+did\s+i\s+upload|what\s+are\s+my\s+skills|what\s+is\s+my)\b",
         r"\b(mera|meri|mere|apna|apni|apne)\s+(profile|role|resume|cv|skills?|projects?|experience|kaam|padhai|education|qualification|background|detail|details|info|score|cgpa|marks|placement|scholarship|fees|timetable|attendance|roll(?:\s*no|\s*number)?|department|college|naam|documents?|uploads?|kya\s+hai|batao|dikhao)\b",
@@ -1105,7 +1107,7 @@ def _retrieval_has_relevant_evidence(candidates: List[Dict[str, Any]], question:
     if any(float(item.get("similarity") or 0.0) >= threshold for item in candidates):
         return True
     exact_fact_intent = bool(re.search(
-        r"phone|mobile|contact|whatsapp|telephone|email|e-mail|roll|enrollment|student\s*id|cgpa|gpa|date of birth|\bdob\b",
+        r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|email|e-mail|ईमेल|roll|enrollment|student\s*id|cgpa|gpa|date of birth|जन्म तिथि|\bdob\b",
         question, re.IGNORECASE,
     ))
     return exact_fact_intent and any("keyword" in item.get("retrieval_methods", []) for item in candidates)
@@ -1116,8 +1118,10 @@ def _retrieval_query_variants(question: str) -> List[str]:
     normalized = re.sub(r"\s+", " ", (question or "").strip())
     variants: List[str] = []
     rules = (
-        (r"phone|mobile|contact|whatsapp|telephone", "mobile phone telephone contact number WhatsApp"),
-        (r"email|e-mail|mail address", "email e-mail contact address"),
+        (r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप",
+         "mobile phone telephone contact number WhatsApp मोबाइल फोन नंबर संपर्क नंबर"),
+        (r"email|e-mail|mail address|ईमेल|मेल पता",
+         "email e-mail contact address ईमेल मेल पता"),
         (r"roll|enrollment|student\s*id", "roll number enrollment number student ID"),
         (r"cgpa|gpa", "CGPA GPA grade point average"),
         (r"date of birth|\bdob\b", "date of birth birth date DOB"),
@@ -1216,7 +1220,7 @@ def retrieve_with_recovery(
 
 def _no_evidence_followup(question: str) -> str:
     """Ask one useful follow-up after semantic, lexical and recovery attempts fail."""
-    if re.search(r"\b(mera|meri|mujhe|batao|dikhao|kya|hai|ka|ki|ke)\b", question, re.IGNORECASE):
+    if re.search(r"\b(mera|meri|mujhe|batao|dikhao|kya|hai|ka|ki|ke)\b|फोन|मोबाइल|बताओ|क्या", question, re.IGNORECASE):
         return (
             "Maine available documents mein semantic search, keyword search aur alternate query se bhi "
             "relevant text verify nahi kar paya. Aap kis uploaded document ya topic ke andar search karwana "
@@ -1906,8 +1910,12 @@ _FACTUAL_PATTERNS = [
     (r"email",
      r"([\w.+-]+@[\w-]+\.[\w.-]+)",
      "Email"),
-    # Phone
-    (r"(?:phone|mobile|contact|whatsapp)",
+    # Email
+    (r"(?:email|e-mail|ईमेल|मेल पता)",
+     r"([\w.+-]+@[\w-]+\.[\w.-]+)",
+     "Email"),
+    # Phone, including Hindi questions (the source value is preserved verbatim)
+    (r"(?:phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप)",
      r"(?:(?:\+91[\s-]?)?[6-9](?:[\s-]?\d){9})",
      "Phone"),
     # CGPA / GPA
