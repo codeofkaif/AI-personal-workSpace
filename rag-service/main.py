@@ -263,7 +263,7 @@ def get_db_connection():
             host=os.getenv("DB_HOST", "localhost"),
             port=int(os.getenv("DB_PORT", "5432")),
             database=os.getenv("DB_NAME", "ai_workspace"),
-            user=os.getenv("DB_USER", "kaifkhan"),
+            user=os.getenv("DB_USER", "postgres"),
             password=os.getenv("DB_PASSWORD", ""),
             connect_timeout=max(1, int(os.getenv("DB_CONNECT_TIMEOUT_SEC", "5"))),
             application_name="ai-personal-workspace-rag",
