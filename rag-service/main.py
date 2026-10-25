@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="AI Personal Workspace — RAG Service",
     description="FastAPI service for document ingestion, embeddings, and role-aware AI Q&A",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 app.add_middleware(
