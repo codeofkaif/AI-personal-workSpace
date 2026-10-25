@@ -82,6 +82,19 @@ def test_valid_citation_is_preserved():
     assert main._validate_source_citations(answer, context) == answer
 
 
+def test_factual_extractor_accepts_spaced_and_hyphenated_phone_number():
+    context = [{
+        "filename": "profile.pdf",
+        "content": "Contact details: Mobile Number: +91 98765-43210",
+    }]
+    answer = main._extract_factual_answer(
+        "give me my mobile phone number", context, "Test"
+    )
+    assert answer is not None
+    assert "+91 98765-43210" in answer
+    assert "[Source: profile.pdf]" in answer
+
+
 class FakeVectorBatch(list):
     def tolist(self):
         return list(self)
@@ -374,16 +387,30 @@ def test_conversation_history_is_bounded_to_most_recent_eight_turns():
     assert normalized[-1]["content"] == "Question 9"
 
 
-def test_obvious_unclear_query_returns_followup_without_db_embedding_or_generation(monkeypatch):
+def test_unclear_query_asks_followup_only_after_retrieval_recovery(monkeypatch):
     from fastapi.testclient import TestClient
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Clarification must happen before profile lookup, embeddings and retrieval")
+    calls = {"retrieval": 0}
 
-    monkeypatch.setattr(main, "fetch_user_profile", forbidden)
-    monkeypatch.setattr(main, "get_embedding", forbidden)
-    monkeypatch.setattr(main, "retrieve_context", forbidden)
-    monkeypatch.setattr(main, "generate_answer", forbidden)
+    monkeypatch.setattr(main, "RAG_QUERY_CLARIFICATION_ENABLED", False)
+    monkeypatch.setattr(
+        main,
+        "fetch_user_profile",
+        lambda user_id, passed_profile=None: {
+            "id": user_id, "name": "Test User", "role": "STUDENT",
+            "department": "CSE", "college": "Test College", "college_id": 7,
+        },
+    )
+
+    def exhausted_retrieval(*args, **kwargs):
+        calls["retrieval"] += 1
+        return []
+
+    def forbidden_generation(*args, **kwargs):
+        raise AssertionError("No answer may be generated without retrieved evidence")
+
+    monkeypatch.setattr(main, "retrieve_with_recovery", exhausted_retrieval)
+    monkeypatch.setattr(main, "generate_answer", forbidden_generation)
     headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
 
     with TestClient(main.app) as client:
@@ -394,10 +421,11 @@ def test_obvious_unclear_query_returns_followup_without_db_embedding_or_generati
         )
     assert response.status_code == 200, response.text
     payload = response.json()
+    assert calls["retrieval"] == 1
     assert payload["clarification_needed"] is True
     assert payload["sources"] == []
     assert payload["chunks_used"] == 0
-    assert payload["answer"]
+    assert "uploaded document" in payload["answer"]
 
 
 def test_pending_clarification_combines_original_request_and_reply(monkeypatch):
@@ -446,7 +474,7 @@ def test_classifier_can_normalize_a_typo_before_retrieval(monkeypatch):
     assert result["normalized_query"] == "Explain dependency injection in Spring Boot"
 
 
-def test_ambiguous_short_query_asks_one_specific_followup(monkeypatch):
+def test_ambiguous_short_query_still_reaches_retrieval(monkeypatch):
     monkeypatch.setattr(
         main, "_classify_query_clarity",
         lambda question, history: {
@@ -456,8 +484,8 @@ def test_ambiguous_short_query_asks_one_specific_followup(monkeypatch):
         },
     )
     result = main.understand_query("Explain Spring", [])
-    assert result["action"] == "clarify"
-    assert result["clarification_question"].endswith("season?")
+    assert result["action"] == "answer"
+    assert result["normalized_query"] == "Explain Spring"
 
 
 def test_clear_short_query_proceeds_when_classifier_confirms_intent(monkeypatch):
