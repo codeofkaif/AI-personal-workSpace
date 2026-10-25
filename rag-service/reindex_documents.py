@@ -27,6 +27,7 @@ from main import (  # noqa: E402
     CHUNK_SIZE_TOKENS,
     CHUNK_OVERLAP_TOKENS,
     CHUNKING_VERSION,
+    content_fingerprint,
     chunk_text,
     ensure_chunk_schema,
     extract_pages_from_file,
@@ -202,9 +203,7 @@ def main() -> int:
                         "chunking_version": CHUNKING_VERSION,
                         "chunk_size_tokens": CHUNK_SIZE_TOKENS,
                         "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
-                        "content_hash": __import__("hashlib").sha256(
-                            " ".join(content.split()).lower().encode("utf-8")
-                        ).hexdigest()[:16],
+                        "content_hash": content_fingerprint(content),
                         "heading": heading,
                         "page_number": page_number,
                     }
