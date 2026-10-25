@@ -41,6 +41,74 @@ def test_self_reference_uses_word_boundaries():
     assert main.is_self_referential_query("Main kaun hu?", profile)
 
 
+def test_self_referential_detector_handles_contact_facts_in_english_and_hinglish():
+    profile = {"name": "Test User"}
+    assert main.is_self_referential_query("give me my mobile phone number", profile)
+    assert main.is_self_referential_query("Mera mobile number batao", profile)
+    assert main.is_self_referential_query("my email address", profile)
+
+
+def test_personal_contact_question_prioritizes_personal_scope_only_after_authored_intent(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    seen_scopes = []
+    monkeypatch.setattr(main, "RAG_QUERY_CLARIFICATION_ENABLED", False)
+    monkeypatch.setattr(
+        main,
+        "fetch_user_profile",
+        lambda user_id, passed_profile=None: {
+            "id": user_id, "name": "Test User", "role": "STUDENT",
+            "department": "CSE", "college": "Test College", "college_id": 7,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "retrieve_with_recovery",
+        lambda question, user_id, scope, top_k, is_self, user_profile: (
+            seen_scopes.append(scope) or []
+        ),
+    )
+    headers = {"X-RAG-API-Key": main.RAG_API_KEY} if main.RAG_API_KEY else {}
+    with TestClient(main.app) as client:
+        default_scope = client.post(
+            "/query",
+            json={"question": "give me my mobile phone number", "user_id": 42,
+                  "scope": "College + Personal", "top_k": 5},
+            headers=headers,
+        )
+        explicit_college_scope = client.post(
+            "/query",
+            json={"question": "give me my mobile phone number", "user_id": 42,
+                  "scope": "College Only", "top_k": 5},
+            headers=headers,
+        )
+    assert default_scope.status_code == 200
+    assert explicit_college_scope.status_code == 200
+    assert seen_scopes == ["Personal Only", "College Only"]
+
+
+def test_weak_retrieval_retries_query_variants_before_returning_no_evidence(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "get_embedding", lambda query, is_query=False: [len(query)])
+    monkeypatch.setattr(main, "_retrieval_query_variants", lambda question: ["mobile phone contact number"])
+    def retrieve(question, embedding, user_id, scope, top_k, is_self=False, user_profile=None):
+        calls.append(question)
+        score = 0.01 if len(calls) == 1 else 0.88
+        return [{
+            "id": len(calls), "content": "Mobile number is +91 98765-43210",
+            "filename": "profile.pdf", "similarity": score, "rrf_score": 0.05,
+            "retrieval_methods": ["dense"],
+        }]
+    monkeypatch.setattr(main, "retrieve_context", retrieve)
+    result = main.retrieve_with_recovery(
+        "give me my mobile phone number", 42, "Personal Only", 5,
+        True, {"name": "Test User"},
+    )
+    assert calls == ["give me my mobile phone number", "mobile phone contact number"]
+    assert result
+    assert result[0]["similarity"] == 0.88
+
+
 def test_scope_filter_denies_unauthenticated_user():
     clause, params = main._scope_filter(None, "College + Personal")
     assert clause == "FALSE"
