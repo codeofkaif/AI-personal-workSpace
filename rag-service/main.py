@@ -83,14 +83,27 @@ class DeleteResponse(BaseModel):
     document_id: int
     chunks_deleted: int
 
-# ── Global SentenceTransformer Model ─────────────────────────────────────────
-
-# Model and vector-column dimensions must match. A model change requires re-embedding all chunks.
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "intfloat/multilingual-e5-small")
-EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
+# ── Embedding and vector storage configuration ────────────────────────────────
+# Keep the historical backend as the code default for backwards compatibility.
+# New installs use the target settings in .env.example: Gemini + Qdrant.
+RAG_VECTOR_BACKEND = os.getenv("RAG_VECTOR_BACKEND", "pgvector").strip().lower()
+if RAG_VECTOR_BACKEND not in {"pgvector", "qdrant"}:
+    raise RuntimeError("RAG_VECTOR_BACKEND must be either 'pgvector' or 'qdrant'.")
+EMBEDDING_MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL_NAME",
+    "gemini-embedding-2" if RAG_VECTOR_BACKEND == "qdrant" else "intfloat/multilingual-e5-small",
+).strip()
+EMBEDDING_DIMENSION = int(os.getenv(
+    "EMBEDDING_DIMENSION", "768" if RAG_VECTOR_BACKEND == "qdrant" else "384"
+))
 LEGACY_EMBEDDING_MODEL_NAME = os.getenv("LEGACY_EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
-if EMBEDDING_DIMENSION != 384:
-    raise RuntimeError("This schema currently uses vector(384). A different embedding dimension requires a database migration.")
+if RAG_VECTOR_BACKEND == "pgvector" and EMBEDDING_DIMENSION != 384:
+    raise RuntimeError("The legacy pgvector schema uses vector(384); use a migration before changing dimensions.")
+if RAG_VECTOR_BACKEND == "qdrant":
+    if EMBEDDING_MODEL_NAME not in {"gemini-embedding-2", "gemini-embedding-001"}:
+        raise RuntimeError("The Qdrant provider supports Gemini embedding models only; use a separate collection for other models.")
+    if EMBEDDING_DIMENSION < 128 or EMBEDDING_DIMENSION > 3072:
+        raise RuntimeError("Gemini embedding dimension must be between 128 and 3072.")
 CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "350"))
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
@@ -122,6 +135,8 @@ _embedding_model_lock = Lock()
 
 def get_model():
     global _embedding_model
+    if RAG_VECTOR_BACKEND == "qdrant":
+        raise RuntimeError("The Gemini/Qdrant provider does not load the local SentenceTransformer model.")
     if _embedding_model is None:
         with _embedding_model_lock:
             if _embedding_model is None:
@@ -137,10 +152,19 @@ def get_model():
                 logger.info("Embedding model %s ready (dimension=%s)", EMBEDDING_MODEL_NAME, dimension)
     return _embedding_model
 
-def get_embeddings(texts: List[str], is_query: bool = False) -> List[List[float]]:
-    """Batch-encode and normalize texts; applies the required E5 query/passage prefix."""
+def get_embeddings(
+    texts: List[str],
+    is_query: bool = False,
+    titles: Optional[List[Optional[str]]] = None,
+) -> List[List[float]]:
+    """Embed texts using the explicitly configured provider; never mix model spaces."""
     if not texts or any(not value or not value.strip() for value in texts):
         raise ValueError("Cannot embed an empty text")
+    if titles is not None and len(titles) != len(texts):
+        raise ValueError("titles must have the same length as texts")
+    if RAG_VECTOR_BACKEND == "qdrant":
+        from vector_store import gemini_embed_texts
+        return gemini_embed_texts(texts, is_query=is_query, titles=titles)
     model_inputs = []
     for value in texts:
         if "multilingual-e5" in EMBEDDING_MODEL_NAME.lower() or "e5-small" in EMBEDDING_MODEL_NAME.lower():
@@ -376,7 +400,11 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
     """Paragraph-aware chunks bounded with the embedding tokenizer when available."""
     target = max(64, chunk_size or CHUNK_SIZE_TOKENS)
     overlap_tokens = max(0, min(overlap if overlap is not None else CHUNK_OVERLAP_TOKENS, target // 3))
-    tokenizer = getattr(get_model(), "tokenizer", None)
+    if RAG_VECTOR_BACKEND == "qdrant":
+        from vector_store import get_text_tokenizer
+        tokenizer = get_text_tokenizer()
+    else:
+        tokenizer = getattr(get_model(), "tokenizer", None)
 
     def size_of(value: str) -> int:
         if tokenizer:
@@ -403,7 +431,11 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
         return [" ".join(words[i:i + target]) for i in range(0, len(words), step)]
 
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
-    units = [piece for part in paragraphs for piece in split_large(part)]
+    # Markdown/Unstructured headings remain explicit chunk units.
+    units = []
+    for part in paragraphs:
+        pieces = split_large(part)
+        units.extend(pieces)
     chunks, current, current_size = [], [], 0
     for unit in units:
         unit_size = size_of(unit)
@@ -424,7 +456,9 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
     return [chunk for chunk in chunks if chunk.strip()]
 
 def ensure_chunk_schema(conn) -> None:
-    """Create/update chunk schema and label legacy vectors with their original model."""
+    """Create/update the legacy pgvector schema only."""
+    if RAG_VECTOR_BACKEND == "qdrant":
+        raise RuntimeError("Do not initialize pgvector chunk storage while Qdrant is the configured vector backend.")
     cur = conn.cursor()
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
     cur.execute("""
@@ -460,8 +494,13 @@ def initialize_rag_storage():
         logger.warning("Database unavailable during startup; schema will be initialized during ingestion.")
         return
     try:
-        ensure_chunk_schema(conn)
-        logger.info("RAG chunk schema initialized")
+        if RAG_VECTOR_BACKEND == "qdrant":
+            from vector_store import ensure_qdrant_collection
+            info = ensure_qdrant_collection()
+            logger.info("Qdrant collection initialized: %s", info["collection"])
+        else:
+            ensure_chunk_schema(conn)
+            logger.info("RAG chunk schema initialized")
     except Exception:
         conn.rollback()
         logger.exception("Could not initialize RAG chunk schema")
