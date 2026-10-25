@@ -232,6 +232,41 @@ class FakeE5Model:
         return FakeVectorBatch([[1.0] + [0.0] * (main.EMBEDDING_DIMENSION - 1) for _ in texts])
 
 
+def test_query_embedding_cache_reuses_identical_query(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "RAG_QUERY_EMBED_CACHE_SIZE", 2)
+    main._query_embed_cache.clear()
+    def fake_embeddings(texts, is_query=False, titles=None):
+        calls.append((list(texts), is_query))
+        return [[float(len(texts[0]))] * main.EMBEDDING_DIMENSION]
+    monkeypatch.setattr(main, "get_embeddings", fake_embeddings)
+    first = main.get_embedding("same private query", is_query=True)
+    second = main.get_embedding("same private query", is_query=True)
+    assert first == second
+    assert len(calls) == 1
+    main._query_embed_cache.clear()
+
+
+def test_enrich_text_for_index_preserves_original_phone_and_adds_compact_form():
+    source = "Mobile Number: +91 98765-43210"
+    enriched = main.enrich_text_for_index(source)
+    assert source in enriched
+    assert "919876543210" in enriched
+    assert main.compact_digit_runs("98765 43210") == "9876543210"
+
+
+def test_weak_search_uses_aliases_without_llm_rewrite_by_default(monkeypatch):
+    monkeypatch.setattr(main, "RAG_QUERY_REWRITE_LLM", False)
+    monkeypatch.setattr(
+        main,
+        "_call_ollama",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Ollama rewrite is disabled")),
+    )
+    variants = main._retrieval_query_variants("What is my mobile number?")
+    assert variants
+    assert "mobile phone" in variants[0].lower()
+
+
 def test_e5_uses_query_and_passage_prefixes(monkeypatch):
     fake = FakeE5Model()
     monkeypatch.setattr(main, "get_model", lambda: fake)
