@@ -222,6 +222,7 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
     """Fetch complete user identity and placement data from DB or passed payload"""
     profile = {
         "id": user_id,
+        "college_id": None,  # Never accept tenant scope from a client-supplied profile.
         "name": "User",
         "email": "",
         "role": "UNKNOWN",
@@ -235,7 +236,10 @@ def fetch_user_profile(user_id: Optional[int], passed_profile: Optional[Dict[str
 
     if passed_profile and isinstance(passed_profile, dict):
         # Treat passed profile as a hint only; verified DB fields below take precedence.
-        profile.update({k: v for k, v in passed_profile.items() if v is not None})
+        profile.update({
+            k: v for k, v in passed_profile.items()
+            if v is not None and k not in {"id", "user_id", "college_id", "is_college_doc"}
+        })
 
     if not user_id:
         return profile
@@ -601,7 +605,8 @@ def retrieve_context(question: str, question_embedding: List[float], user_id: Op
                 is_self=is_self,
             )
             reranked = _rerank_candidates(
-                question, candidates, top_k, is_self=is_self, user_profile=user_profile
+                question, candidates, max(top_k, RAG_CANDIDATE_K),
+                is_self=is_self, user_profile=user_profile
             )
             for item in reranked:
                 item["filename"] = item.get("filename") or item.get("metadata", {}).get("filename") or "Document"
@@ -1095,7 +1100,11 @@ def ingest_document(
             raise HTTPException(status_code=413, detail="Uploaded file exceeds the configured size limit.")
         logger.info("Ingesting %s (%s bytes) for user %s backend=%s", filename, len(file_bytes), user_id, RAG_VECTOR_BACKEND)
 
-        page_texts = [(page, value) for page, value in extract_pages_from_file(file_bytes, filename) if value.strip()]
+        try:
+            extracted_pages = extract_pages_from_file(file_bytes, filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        page_texts = [(page, value) for page, value in extracted_pages if value.strip()]
         if not page_texts:
             message = (
                 f"No readable text could be extracted from '{filename}'. "
