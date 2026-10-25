@@ -5,7 +5,7 @@
 [![React](https://img.shields.io/badge/Frontend-React%2019%20%2B%20Vite-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 [![Spring Boot](https://img.shields.io/badge/Backend-Spring%20Boot%203.3.5-6DB33F?logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
 [![FastAPI](https://img.shields.io/badge/AI%20Service-FastAPI%20%2B%20PyTorch-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL%20%2B%20pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![PostgreSQL](https://img.shields.io/badge/Metadata-PostgreSQL-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/) [![Qdrant](https://img.shields.io/badge/Vector%20DB-Qdrant-DC244C)](https://qdrant.tech/)
 
 ---
 
@@ -38,14 +38,14 @@ The system is built upon four robust, decoupled pillars:
                 ▼                                        ▼
 ┌────────────────────────────────────────────────────────┐
 │             AI Service (FastAPI + Python)              │
-│  Sentence-Transformers • pgvector • Ollama / Local LLM │
+│  Gemini Embeddings • Qdrant Hybrid Search • Ollama LLM │
 └────────────────────────────────────────────────────────┘
 ```
 
 1. **Frontend (React 19 + Vite + Tailwind CSS)**: Intuitive, high-performance web interface tailored by role (Student, Faculty, HOD, Dean).
 2. **Backend (Spring Boot 3.3.5 + Java 21)**: Enterprise-grade REST API, JWT authentication, role-based authorization, database transactions, and business logic.
-3. **AI / RAG Service (FastAPI + Python 3.10+)**: Text extraction, semantic chunking, multilingual E5 embeddings, hybrid vector + PostgreSQL full-text retrieval, optional multilingual cross-encoder reranking, and grounded local-LLM answers with source labels.
-4. **Database (PostgreSQL + pgvector)**: Relational application storage combined with native vector similarity search.
+3. **AI / RAG Service (FastAPI + Python 3.10+)**: Structure-aware parsing, token-aware chunking, Google Gemini embeddings, Qdrant dense + sparse hybrid retrieval, optional cross-encoder reranking, recovery search, and grounded local-LLM answers with source citations.
+4. **Data Stores**: PostgreSQL remains the source of truth for users, documents and access control. Qdrant stores versioned vectors and chunk payloads for hybrid retrieval.
 
 ---
 
@@ -223,76 +223,106 @@ Important settings:
 
 ---
 
-## 🧠 RAG quality, model migration, and evaluation
+## 🧠 Production RAG: Gemini + Qdrant
 
-### What the RAG service now uses
+The target configuration in `.env.example` uses **Gemini Embedding 2 + Qdrant dense/sparse hybrid retrieval**. PostgreSQL remains the authoritative store for user profiles, document ownership, college membership and document metadata; it is not replaced by Qdrant.
 
-- **Embeddings:** intfloat/multilingual-e5-small (384 dimensions), with the required query: and passage: prefixes. It is a multilingual retrieval model; language support does not guarantee equal quality for every language. See the [model card](https://huggingface.co/intfloat/multilingual-e5-small).
-- **Chunking:** paragraph-aware token chunks, configurable with CHUNK_SIZE_TOKENS (default 350) and CHUNK_OVERLAP_TOKENS (default 50). PDF page numbers are retained. Context assembly deduplicates chunks and obeys RAG_CONTEXT_TOKEN_BUDGET (default 1800) and RAG_CONTEXT_CHUNKS (default 4).
-- **Retrieval:** dense pgvector search and PostgreSQL full-text search, fused using Reciprocal Rank Fusion. Concurrent query and ingestion limits prevent local inference work from growing without bounds.
-- **Reranking:** optional local cross-encoder, configured with RERANK_ENABLED and RERANKER_MODEL_NAME. The configured multilingual MS MARCO cross-encoder was trained using translated ranking data; verify performance on this project's own Hindi/Hinglish and English test set. See [its model card](https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1).
-- **Generation:** Ollama with the model selected by `OLLAMA_MODEL` (the safe example uses `qwen3.5:9b-q4_K_M`), temperature=0.1, num_ctx=4096, bounded output tokens, and a keep-warm interval. These are starting defaults; benchmark your actual hardware and questions before changing them. Set `RAG_WARMUP_ON_STARTUP=true` to load embedding/reranker/LLM models before serving requests and reduce first-query latency (at the cost of slower startup).
-- **Evidence handling:** invalid source labels cause excerpt fallback; if no source label is emitted, the service appends the actual retrieved source labels. This is source-label validation, not a guarantee that every natural-language claim is entailed by the source.
-- **Safety:** RAG endpoints support a shared X-RAG-API-Key. Production mode refuses protected query/ingestion calls if RAG_ENV=production but RAG_API_KEY is missing. FastAPI binds to 127.0.0.1 by default and development reload is disabled when RAG_ENV=production. Only set RAG_HOST=0.0.0.0 if external devices genuinely need access, and then enforce a shared secret, firewall rules, and appropriate CORS origins. Configure the same key in Spring Boot.
+### Retrieval and indexing flow
 
-### Important: re-index old documents once
+1. **Parse and validate** PDF, scanned PDF, DOCX, PPTX, HTML, TXT, Markdown, CSV and JSON. Native parsers are preferred where reliable; Unstructured preserves element structure; Tesseract OCR is used for empty PDF pages when installed.
+2. **Chunk with structure**. `chunk_text()` uses the configured local tokenizer for bounded chunks, carries Markdown/uppercase section headings into related chunks, and preserves page/slide provenance.
+3. **Embed consistently**. Documents and queries use the configured Gemini model and dimension. The Gemini embedding provider validates vector count, dimensions and finite values, normalizes vectors, bounds retries and does not silently fall back to a different embedding space.
+4. **Index in Qdrant**. Each point holds a named dense vector, a BM25-style sparse vector, text and versioned source/ownership metadata. New document generations are staged as pending, activated only after upload succeeds, then old active points are retired.
+5. **Search and recover**. Dense and sparse candidate ranks are fused with Reciprocal Rank Fusion. Query aliases help exact-fact questions; weak searches can trigger up to two bounded rewrite attempts. A follow-up is returned only after the configured retrieval/recovery pipeline fails to find evidence.
+6. **Verify permissions and evidence**. Qdrant metadata filters are checked against live PostgreSQL ownership and college membership before chunks reach the answer generator. Answers use retrieved evidence and source labels; missing evidence does not become a fabricated answer.
 
-The embedding model and chunking strategy changed. Old vectors must not be mixed with new vectors. Existing records are marked with the legacy model; the retrieval path only searches vectors whose recorded model matches the configured model. Before testing college-only queries, inspect legacy shared-document scope metadata with `psql -d ai_workspace -c "SELECT d.id, d.title, u.college_id FROM documents d JOIN users u ON u.id = d.user_id WHERE d.is_college_doc IS TRUE AND d.college_id IS NULL;"`. If the result is correct, apply `psql -d ai_workspace -f docs/migrations/fix_college_document_scope.sql`. Documents whose uploader has no college association remain excluded until that ownership metadata is fixed.
+### Set up locally
 
-1. Confirm your uploaded files still exist under backend/uploads.
-2. Set EMBEDDING_MODEL_NAME=intfloat/multilingual-e5-small and LEGACY_EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2 in .env.
-3. Preview re-indexing first:
+From the repository root:
 
-   \`\`\`bash
-   set -a
-   source .env
-   set +a
+```bash
+bash ./setup-rag-env.sh
+```
+
+The script creates `.env` from `.env.example` **only when a local `.env` does not already exist** and attempts to set file permissions to owner-only. It never overwrites an existing environment file. The root `.env` is ignored by Git; only the placeholder-based `.env.example` belongs in the repository.
+
+1. Open `.env` locally and set `GEMINI_API_KEY` to your key. Also verify `DB_USER`, `DB_PASSWORD`, `JWT_SECRET`, and `RAG_API_KEY`. The same `RAG_API_KEY` must be configured for Spring Boot and FastAPI. Do not paste a real key into a committed file.
+2. Start Docker Desktop and launch Qdrant:
+   ```bash
+   docker compose -f docker-compose.rag.yml up -d
+   ```
+   The local Qdrant ports bind to `127.0.0.1`; do not expose an unauthenticated local instance to the public internet.
+3. Install the Python dependencies in a virtual environment:
+   ```bash
+   python3 -m venv rag-service/venv
+   source rag-service/venv/bin/activate
+   python -m pip install --upgrade pip
+   pip install -r rag-service/requirements.txt
+   ```
+4. Check that the source documents still exist under `backend/uploads/`. First validate parsing/chunking without calling the Gemini API:
+   ```bash
    python rag-service/reindex_documents.py --dry-run
-   \`\`\`
-
-4. If the preview reports all expected files, run:
-
-   \`\`\`bash
+   ```
+   This dry run does not modify either index or make embedding API calls. Any missing source file or unreadable document is reported; fix it before migration.
+5. Reindex to the configured Qdrant collection:
+   ```bash
    python rag-service/reindex_documents.py
-   \`\`\`
+   ```
+   This requires the real `GEMINI_API_KEY` and PostgreSQL metadata connection. Each document is staged independently and reported as success/failure. Review the final summary and investigate **every** skipped or failed document. The script returns nonzero if documents were skipped or failed.
+6. Start FastAPI and Spring Boot as described in Getting Started. Check `http://127.0.0.1:8000/health`; confirm the reported `vector_store`, collection name, embedding model and dimension. Upload a new test document and verify retrieval/scope behavior before relying on the new index.
 
-5. Restart the RAG service and test representative personal and college-document queries.
+### Important configuration
 
-The script replaces each document's chunks atomically and reports missing files rather than silently dropping them. If a source file is missing, re-upload it through the application before proceeding. Scanned PDFs can use optional local OCR through PyMuPDF + Tesseract. On macOS, install the Tesseract binary (for example, brew install tesseract); then verify its language packs with tesseract --list-langs. Set OCR_LANG=eng+hin only when both language packs are installed. If Tesseract is unavailable or OCR returns no text, ingestion reports that no readable text was indexed rather than claiming success.
+| Variable | Purpose |
+| --- | --- |
+| `RAG_VECTOR_BACKEND=qdrant` | Selects the new retrieval backend. Set `pgvector` only for legacy rollback. |
+| `GEMINI_API_KEY` | Local-only Google Gen AI key; never commit it. |
+| `EMBEDDING_MODEL_NAME=gemini-embedding-2` | Embedding model. `gemini-embedding-001` can be evaluated with a separate collection. |
+| `EMBEDDING_DIMENSION=768` | Dense vector dimension for this collection. Use a new collection and full re-index when changing model or dimension. |
+| `QDRANT_URL` | Local Qdrant URL, default `http://localhost:6333`. |
+| `QDRANT_COLLECTION_NAME` | Versioned collection used for this model/dimension. |
+| `QDRANT_SPARSE_MODEL=Qdrant/bm25` | FastEmbed sparse lexical retrieval model. Its English-oriented stemming means Hindi/Hinglish ranking quality must be measured, not assumed; Gemini dense retrieval and query aliases complement it. |
+| `CHUNK_SIZE_TOKENS` / `CHUNK_OVERLAP_TOKENS` | Starting defaults 450/60. Tune only against a labelled project dataset. |
+| `RAG_CANDIDATE_K=30` | Candidate pool before relevance filtering/reranking. |
+| `QDRANT_MIN_DENSE_SCORE=0.35` | Initial score gate. Calibrate on real relevant and irrelevant examples; this is not a universal threshold. |
+| `RERANK_ENABLED=false` | Optional local cross-encoder reranking; enable only after checking Hindi/Hinglish quality and Mac memory/latency. |
+| `OCR_ENABLED=true`, `OCR_LANG=eng` | Scanned-PDF OCR. On macOS install Tesseract and its language packs; use `eng+hin` only if both are installed. |
 
-### Intelligent query clarification
+### Migration safety
 
-The chat can ask a follow-up before document retrieval when a query is materially ambiguous, missing context, or difficult to interpret. Clear queries with obvious typos are normalized and sent through the normal RAG path. Recent user/assistant turns are passed from React through Spring Boot to FastAPI so follow-ups such as “what are its drawbacks?” can be resolved from the chat context.
-
-Configure `RAG_QUERY_CLARIFICATION_ENABLED=true` in the root `.env` to enable the pre-retrieval classifier. It uses the configured Ollama model with a small context/output budget; this adds a model call for short, referential, or potentially garbled queries. If the classifier is unavailable, the service uses deterministic clarification for obviously incomplete prompts and otherwise falls back to the original query. A clarification API response has `clarification_needed=true`, an empty source list, and `chunks_used=0`; no vector/keyword search or answer generation is performed for that turn. The user’s next reply should name the intended topic/option rather than just “yes”.
+- The legacy pgvector path remains available via `RAG_VECTOR_BACKEND=pgvector`, but its `vector(384)` schema is only compatible with the legacy E5 model. Never write Gemini vectors into that schema.
+- Qdrant collection names include model/dimension by default. Collection schema is checked on startup. If you change the model or output dimension, use a new collection and re-embed every document.
+- The original PostgreSQL document rows and files are not deleted by this migration. Do not drop the old pgvector table/index until you have compared retrieval results and verified document coverage.
+- The re-index script reads from `backend/uploads/` (override with `--upload-dir` if your actual upload location differs). It cannot recover source files that are missing from disk.
+- Qdrant uses payload metadata for candidate filtering, then the FastAPI service checks linked document permissions against live PostgreSQL before using any retrieved text. Keep the RAG service key private and do not expose it directly in the frontend.
 
 ### Regression tests
 
-\`\`\`bash
+```bash
 cd rag-service
 python -m pip install -r requirements.txt
+python -m py_compile main.py vector_store.py document_parser.py reindex_documents.py evaluate_retrieval.py
 pytest -q
-python -m py_compile main.py reindex_documents.py evaluate_retrieval.py
-\`\`\`
+```
+
+GitHub Actions runs the lightweight regression suite. API/network, Qdrant, OCR and answer-level tests still require integration runs with local services and actual credentials.
 
 ### Retrieval evaluation
 
-Build a manually verified JSONL dataset using real user IDs and relevant chunk IDs, then run:
+Create a manually verified JSONL file with real user IDs and relevant chunk IDs/UUIDs. For example:
 
-\`\`\`bash
-set -a
-source .env
-set +a
+```json
+{"question":"What is my mobile number?","user_id":12,"scope":"Personal Only","relevant_chunk_ids":["qdrant-point-uuid-from-your-index"]}
+{"question":"Exam date kya hai?","user_id":12,"scope":"College Only","relevant_chunk_ids":["another-point-uuid"]}
+```
+
+Run the evaluator after the service dependencies and database are ready:
+
+```bash
 python rag-service/evaluate_retrieval.py rag-service/evaluation/questions.jsonl --output rag-service/evaluation/latest-report.json
-\`\`\`
+```
 
-Each line should look like:
-
-\`\`\`json
-{"question":"What is the exam date?","user_id":12,"scope":"College + Personal","relevant_chunk_ids":[18,27]}
-\`\`\`
-
-Use real values from your database; the IDs above are illustrative. The evaluator reports retrieval latency p50/p95, Recall@5, MRR@10, and NDCG@5 for queries with verified gold chunk IDs. These are retrieval metrics only. Answer correctness, unsupported claims, and citation entailment need a separately reviewed answer-level dataset. Compare changes on the same dataset and hardware; do not treat unmeasured improvements as established facts.
+The evaluator uses the same retrieval-recovery path and reports Recall@5, Recall@10, MRR@10, nDCG@5, and retrieval latency p50/p95. Use the same labelled dataset for the old/new comparison. These are retrieval metrics only; separately review answer correctness, citation entailment, unsupported-answer rate, exact-fact extraction, tenant isolation, and full response latency. Do not claim accuracy improvements until those measurements demonstrate them.
 
 ## 📜 License
 
