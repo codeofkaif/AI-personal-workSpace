@@ -1585,6 +1585,7 @@ def delete_document_chunks(
     conn = get_db_connection()
     if conn is None:
         raise HTTPException(status_code=503, detail="RAG database is unavailable.")
+    cur = None
     try:
         cur = conn.cursor()
         cur.execute("SELECT user_id FROM documents WHERE id = %s FOR UPDATE", (document_id,))
