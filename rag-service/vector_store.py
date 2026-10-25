@@ -571,7 +571,11 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
             "roll number enrollment number student id रोल नंबर नामांकन संख्या",
         ),
         (r"cgpa|gpa|अंक", "CGPA GPA grade point average अंक"),
-        (r"date of birth|\bdob\b|जन्म तिथि", "date of birth DOB birth date जन्म तिथि"),
+        (r"date of birth|\bdob\b|जन्म तिथि|janm\s*tithi", "date of birth DOB birth date जन्म तिथि"),
+        (
+            r"\b(my|mine|mera|meri|mere)\b.{0,25}\bnumber\b",
+            "my mobile phone contact number phone number mobile number",
+        ),
     )
     import re
     for pattern, aliases in exact_patterns:
@@ -644,7 +648,7 @@ def retrieve_hybrid(question: str, dense_query: Sequence[float], user_id: Option
         # A sparse-only hit is retained only for exact-fact intents or when the
         # query has meaningful lexical overlap. Common stopwords cannot make a chunk relevant.
         exact_fact_intent = bool(re.search(
-            r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|email|e-mail|ईमेल|roll|enrollment|student\s*id|cgpa|gpa|date of birth|जन्म तिथि|\bdob\b",
+            r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|email|e-mail|ईमेल|roll|enrollment|student\s*id|cgpa|gpa|date of birth|जन्म तिथि|\bdob\b|\b(my|mine|mera|meri|mere)\b.{0,25}\bnumber\b",
             question, re.IGNORECASE,
         ))
         stopwords = {
