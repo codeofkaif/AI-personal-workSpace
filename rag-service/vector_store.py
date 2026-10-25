@@ -176,22 +176,76 @@ def _embed_one(text: str, *, is_query: bool, title: Optional[str]) -> List[float
 
 def gemini_embed_texts(texts: Sequence[str], *, is_query: bool = False,
                        titles: Optional[Sequence[Optional[str]]] = None) -> List[List[float]]:
-    """Embed a bounded list, preserving one output vector per input and title context."""
+    """Batch Gemini calls using one Content per input (never aggregate multiple chunks)."""
     if not texts:
         return []
     if any(not isinstance(text, str) or not text.strip() for text in texts):
         raise ValueError("Embedding batches cannot contain empty text.")
     if titles is not None and len(titles) != len(texts):
         raise ValueError("titles must have the same length as texts.")
-    max_batch = max(1, min(64, int(os.getenv("EMBEDDING_BATCH_SIZE", "16"))))
+
+    from google.genai import types
+
+    model_name, dimension, _ = get_embedding_config()
+    client = _get_gemini_client()
+    max_batch = max(1, min(32, int(os.getenv("EMBEDDING_BATCH_SIZE", "16"))))
+    attempts = max(1, min(5, int(os.getenv("GEMINI_MAX_RETRIES", "3"))))
     output: List[List[float]] = []
+
     for start in range(0, len(texts), max_batch):
         batch = texts[start:start + max_batch]
         batch_titles = list(titles[start:start + max_batch]) if titles is not None else [None] * len(batch)
-        # Gemini Embedding 2 returns one aggregate vector for a list of inputs, so
-        # submit independent inputs. The bounded loop prevents unbounded API pressure.
-        for text, title in zip(batch, batch_titles):
-            output.append(_embed_one(text, is_query=is_query, title=title))
+        prepared = [
+            prepare_embedding_input(text, is_query=is_query, title=title, model_name=model_name)
+            for text, title in zip(batch, batch_titles)
+        ]
+        # Gemini Embedding 2 aggregates a list of raw text inputs into one vector.
+        # Explicit Content items request separate vectors for each input in the batch.
+        contents = [types.Content(parts=[types.Part.from_text(text=value)]) for value in prepared]
+        config_args: Dict[str, Any] = {"output_dimensionality": dimension}
+        if model_name == "gemini-embedding-001":
+            config_args["task_type"] = "RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT"
+        config = types.EmbedContentConfig(**config_args)
+        last_error = None
+        vectors: Optional[List[List[float]]] = None
+
+        for attempt in range(attempts):
+            try:
+                result = client.models.embed_content(model=model_name, contents=contents, config=config)
+                raw_embeddings = getattr(result, "embeddings", None) or []
+                if len(raw_embeddings) != len(batch):
+                    raise RuntimeError(
+                        f"Gemini returned {len(raw_embeddings)} vectors for {len(batch)} inputs."
+                    )
+                batch_vectors: List[List[float]] = []
+                for embedding in raw_embeddings:
+                    raw_values = getattr(embedding, "values", None)
+                    if not raw_values or len(raw_values) != dimension:
+                        raise RuntimeError("Gemini returned an empty or incompatible embedding vector.")
+                    vector = [float(value) for value in raw_values]
+                    if any(not math.isfinite(value) for value in vector):
+                        raise RuntimeError("Gemini returned non-finite embedding values.")
+                    norm = math.sqrt(sum(value * value for value in vector))
+                    if norm <= 0:
+                        raise RuntimeError("Gemini returned a zero-length embedding.")
+                    # Gemini 2 normalizes reduced dimensions; normalize consistently for both models.
+                    batch_vectors.append([value / norm for value in vector])
+                vectors = batch_vectors
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(min(2 ** attempt, 4))
+        if vectors is None:
+            logger.error("Gemini embedding batch failed after %s attempts (%s).",
+                         attempts, type(last_error).__name__)
+            raise RuntimeError(
+                f"Gemini embedding failed for a batch of {len(batch)} inputs. Check key, model, quota and network."
+            ) from last_error
+        output.extend(vectors)
+
+    if len(output) != len(texts):
+        raise RuntimeError("Gemini embedding provider returned a mismatched output count.")
     return output
 
 
