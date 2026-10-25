@@ -126,9 +126,36 @@ def main() -> int:
 
                 cur = conn.cursor()
                 # Verify the source row still exists and is stable before replacing the index.
-                cur.execute("SELECT id FROM documents WHERE id = %s FOR UPDATE", (document_id,))
-                if cur.fetchone() is None:
+                cur.execute(
+                    """
+                    SELECT d.user_id, d.is_college_doc,
+                           COALESCE(d.college_id, u.college_id) AS college_id
+                    FROM documents d
+                    LEFT JOIN users u ON u.id = d.user_id
+                    WHERE d.id = %s
+                    FOR UPDATE OF d
+                    """,
+                    (document_id,),
+                )
+                current_metadata = cur.fetchone()
+                if current_metadata is None:
                     raise RuntimeError("document record disappeared during reindex")
+                current_user_id, current_college_scope, current_college_id = current_metadata
+                if (
+                    int(current_user_id) != int(user_id)
+                    or bool(current_college_scope) != bool(is_college_doc)
+                    or (
+                        current_college_id is not None and college_id is not None
+                        and int(current_college_id) != int(college_id)
+                    )
+                ):
+                    raise RuntimeError(
+                        "document owner/college scope changed while embeddings were being computed; "
+                        "retry the reindex after reviewing document metadata"
+                    )
+                user_id = int(current_user_id)
+                is_college_doc = bool(current_college_scope)
+                college_id = current_college_id
 
                 if RAG_VECTOR_BACKEND == "qdrant":
                     from vector_store import upsert_document_chunks
