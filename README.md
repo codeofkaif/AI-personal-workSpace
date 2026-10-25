@@ -307,6 +307,49 @@ pytest -q
 
 GitHub Actions runs the lightweight regression suite. API/network, Qdrant, OCR and answer-level tests still require integration runs with local services and actual credentials.
 
+### Model comparison and end-to-end evaluation
+
+The synthetic smoke set and model comparison harness live under `rag-service/evaluation/`. Once the real Gemini key has been added to the ignored local `.env`, compare both supported embedding models using the same labelled example set:
+
+```bash
+python rag-service/benchmark_embedding_models.py \
+  rag-service/evaluation/embedding_benchmark_sample.jsonl \
+  --models gemini-embedding-2 gemini-embedding-001 \
+  --dimension 768 \
+  --output rag-service/evaluation/embedding-benchmark-report.json
+```
+
+The sample set is synthetic; it is a harness check only, not evidence that either model is more accurate for your private documents. Use manually labelled, consented, redacted data for model selection. The report measures dense-only Recall@5/10, MRR@10, nDCG@10, embedding latency and request counts. Actual billing should be checked in the provider's usage dashboard.
+
+For end-to-end answer/citation/refusal checks, create a private JSONL dataset with real user IDs (do **not** commit it or its report if it contains sensitive data), then run:
+
+```bash
+python rag-service/evaluate_end_to_end.py /path/to/private-e2e.jsonl \
+  --base-url http://127.0.0.1:8000 \
+  --output /path/to/private-e2e-report.json
+```
+
+Each case may include `expected_contains`, `expected_sources`, `should_refuse` and `forbidden_terms`. This measures exact-fact substring matches, source filename precision/recall, expected empty-evidence behavior, forbidden-term leakage and end-to-end p50/p95 latency. It is a labelled regression harness, not a proof of general answer faithfulness.
+
+### Backups and rollback
+
+Take a snapshot of the currently configured Qdrant collection before high-risk re-indexing or configuration changes:
+
+```bash
+python rag-service/backup_qdrant.py
+```
+
+The script saves a collection snapshot plus SHA-256 manifest under `backups/qdrant/` (ignored by Git). Restore only into a **new** compatible collection; the utility refuses to overwrite an existing collection:
+
+```bash
+python rag-service/restore_qdrant.py backups/qdrant/your-snapshot.snapshot \
+  --target-collection ai_workspace_gemini_embedding_2_768_restore_v1
+```
+
+Restore snapshots only between compatible Qdrant server versions (same minor version or the next minor version), then validate the collection schema, point counts, permissions and query quality before routing production traffic to it. The restore tool validates the vector dimension and sparse-vector configuration; a successful snapshot restore alone does not establish that the corpus is complete.
+
+The original PostgreSQL/pgvector index remains untouched by Qdrant indexing. To roll back to the legacy path, edit the ignored `.env` to use `RAG_VECTOR_BACKEND=pgvector`, `EMBEDDING_MODEL_NAME=intfloat/multilingual-e5-small`, and `EMBEDDING_DIMENSION=384` (or the exact old model/dimension matching the retained PostgreSQL vectors), restart FastAPI, and verify health/retrieval. Never query stored vectors with a different embedding model.
+
 ### Retrieval evaluation
 
 Create a manually verified JSONL file with real user IDs and relevant chunk IDs/UUIDs. For example:
