@@ -1298,10 +1298,17 @@ def delete_document_chunks(
             raise HTTPException(status_code=404, detail="Document record not found.")
         if int(row[0]) != int(user_id):
             raise HTTPException(status_code=403, detail="User does not own this document.")
-        cur.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
-        deleted = cur.rowcount
+        if RAG_VECTOR_BACKEND == "qdrant":
+            from vector_store import delete_document_chunks as delete_qdrant_document_chunks
+            cur.close()
+            cur = None
+            deleted = delete_qdrant_document_chunks(document_id, user_id)
+        else:
+            cur.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
+            deleted = cur.rowcount
+            cur.close()
+            cur = None
         conn.commit()
-        cur.close()
         return DeleteResponse(success=True, document_id=document_id, chunks_deleted=deleted)
     except HTTPException:
         conn.rollback()
@@ -1311,6 +1318,11 @@ def delete_document_chunks(
         logger.exception("Document chunk deletion failed for id=%s", document_id)
         raise HTTPException(status_code=500, detail="Could not delete the document index.") from e
     finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
         conn.close()
 
 @app.post("/query", response_model=QueryResponse)
