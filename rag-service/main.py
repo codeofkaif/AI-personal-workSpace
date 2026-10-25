@@ -355,51 +355,23 @@ def _ocr_pdf_page(file_bytes: bytes, page_index: int) -> str:
         return ""
 
 def extract_pages_from_file(file_bytes: bytes, filename: str) -> List[tuple[int, str]]:
-    """Extract text with PDF page provenance; non-paginated formats use page 0."""
-    lower_name = (filename or "").lower()
+    """Extract text through structure-aware parsers while preserving page/slide provenance."""
+    from document_parser import extract_document_pages
     try:
-        if lower_name.endswith(".pdf"):
-            import io
-            try:
-                import pypdf
-                reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-            except Exception:
-                import PyPDF2
-                reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-            extracted = []
-            for index, page in enumerate(reader.pages):
-                text = (page.extract_text() or "").replace("\x00", "").strip()
-                if not text:
-                    text = _ocr_pdf_page(file_bytes, index)
-                extracted.append((index + 1, text))
-            return extracted
-        if lower_name.endswith(".docx"):
-            import io
-            import docx
-            document = docx.Document(io.BytesIO(file_bytes))
-            text = "\n\n".join(paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip())
-            # Preserve table text rather than silently dropping it.
-            for table in document.tables:
-                rows = []
-                for row in table.rows:
-                    rows.append(" | ".join(cell.text.strip() for cell in row.cells))
-                if rows:
-                    text += "\n\n" + "\n".join(rows)
-            return [(0, text.replace("\x00", "").strip())] if text.strip() else []
-        if lower_name.endswith(".doc"):
-            raise ValueError("Legacy .doc is not supported; convert it to .docx first.")
-        text = file_bytes.decode("utf-8", errors="ignore").replace("\x00", "").strip()
-        return [(0, text)] if text else []
-    except Exception as e:
-        logger.warning("Text extraction failed for %s: %s", filename, e)
+        return extract_document_pages(file_bytes, filename)
+    except ValueError:
+        raise
+    except Exception as exc:
+        logger.exception("Document extraction failed for %s", filename)
         return []
+
 
 def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     """Compatibility wrapper for callers that only need the extracted text."""
     return "\n\n".join(text for _, text in extract_pages_from_file(file_bytes, filename) if text)
 
 def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[int] = None) -> List[str]:
-    """Paragraph-aware chunks bounded with the embedding tokenizer when available."""
+    """Heading-aware, token-bounded chunks that repeat section context across chunk boundaries."""
     target = max(64, chunk_size or CHUNK_SIZE_TOKENS)
     overlap_tokens = max(0, min(overlap if overlap is not None else CHUNK_OVERLAP_TOKENS, target // 3))
     if RAG_VECTOR_BACKEND == "qdrant":
@@ -416,46 +388,71 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
                 pass
         return len(value.split())
 
-    def split_large(value: str) -> List[str]:
-        if size_of(value) <= target:
+    def split_large(value: str, max_tokens: int = target) -> List[str]:
+        if size_of(value) <= max_tokens:
             return [value]
+        step = max(1, max_tokens - overlap_tokens)
         if tokenizer:
-            ids = tokenizer.encode(value, add_special_tokens=False)
-            pieces = []
-            step = max(1, target - overlap_tokens)
-            for i in range(0, len(ids), step):
-                piece = tokenizer.decode(ids[i:i + target], skip_special_tokens=True).strip()
-                if piece:
-                    pieces.append(piece)
-            return pieces
+            try:
+                ids = tokenizer.encode(value, add_special_tokens=False)
+                pieces = []
+                for i in range(0, len(ids), step):
+                    piece = tokenizer.decode(ids[i:i + max_tokens], skip_special_tokens=True).strip()
+                    if piece:
+                        pieces.append(piece)
+                return pieces
+            except Exception:
+                pass
         words = value.split()
-        step = max(1, target - overlap_tokens)
-        return [" ".join(words[i:i + target]) for i in range(0, len(words), step)]
+        return [" ".join(words[i:i + max_tokens]) for i in range(0, len(words), step)]
 
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
-    # Markdown/Unstructured headings remain explicit chunk units.
-    units = []
+    # Markdown headers are separated from adjacent body text even when the source has
+    # only a single newline after a heading.
+    prepared = re.sub(r"(?m)(^#{1,6}[^\n]+)\n", r"\1\n\n", text or "")
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", prepared) if part.strip()]
+    section_stack: List[tuple[int, str]] = []
+    chunks: List[str] = []
+    pending_heading: Optional[str] = None
+
     for part in paragraphs:
-        pieces = split_large(part)
-        units.extend(pieces)
-    chunks, current, current_size = [], [], 0
-    for unit in units:
-        unit_size = size_of(unit)
-        if current and current_size + unit_size > target:
-            chunks.append("\n\n".join(current))
-            tail, tail_size = [], 0
-            for prior in reversed(current):
-                prior_size = size_of(prior)
-                if tail_size + prior_size > overlap_tokens:
-                    break
-                tail.insert(0, prior)
-                tail_size += prior_size
-            current, current_size = tail, tail_size
-        current.append(unit)
-        current_size += unit_size
-    if current:
-        chunks.append("\n\n".join(current))
+        markdown_heading = re.match(r"^(#{1,6})\s+(.+)$", part, flags=re.DOTALL)
+        all_caps_heading = (
+            len(part) <= 100
+            and "\n" not in part
+            and part.isupper()
+            and any(character.isalpha() for character in part)
+        )
+        if markdown_heading or all_caps_heading:
+            if markdown_heading:
+                level = len(markdown_heading.group(1))
+                title = markdown_heading.group(2).strip()
+            else:
+                level, title = 1, part.strip()
+            section_stack = [(old_level, old_title) for old_level, old_title in section_stack if old_level < level]
+            section_stack.append((level, f"{'#' * level} {title}" if markdown_heading else title))
+            pending_heading = "\n".join(item[1] for item in section_stack)
+            continue
+
+        header = pending_heading
+        header_size = size_of(header) if header else 0
+        # Reserve room for the section heading in each body chunk, bounded by the
+        # selected chunk target. If the header itself is too large, let the body stand alone.
+        use_header = bool(header and header_size < max(16, target // 3))
+        body_limit = max(32, target - header_size - 2) if use_header else target
+        body_pieces = split_large(part, body_limit)
+        for body_piece in body_pieces:
+            value = f"{header}\n{body_piece}".strip() if use_header else body_piece.strip()
+            if value and size_of(value) <= target:
+                chunks.append(value)
+            elif value:
+                chunks.extend(split_large(value, target))
+        pending_heading = header
+
+    # A document consisting only of a heading should still be searchable.
+    if not chunks and pending_heading:
+        chunks.extend(split_large(pending_heading, target))
     return [chunk for chunk in chunks if chunk.strip()]
+
 
 def ensure_chunk_schema(conn) -> None:
     """Create/update the legacy pgvector schema only."""
