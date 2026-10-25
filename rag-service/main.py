@@ -1630,22 +1630,6 @@ def query_ai(req: QueryRequest):
                 clarification_needed=True,
             )
         sources = []
-
-        # 1. Embed question
-        try:
-            question_embedding = get_embedding(effective_question, is_query=True)
-        except Exception as e:
-            logger.exception("Query embedding failed")
-            raise HTTPException(status_code=503, detail="Embedding model unavailable or misconfigured.") from e
-
-        # 2. Retrieve authorized candidates with hybrid dense + lexical RRF ranking.
-        requested_k = max(1, min(int(req.top_k or 5), 8))
-        context_items = retrieve_context(
-            effective_question, question_embedding, req.user_id, scope, requested_k,
-            is_self=is_self, user_profile=user_profile
-        )
-        context_items = select_context_items(context_items)
-        sources = []
         for item in context_items:
             filename = item.get("filename", "Document")
             if filename not in sources:
