@@ -241,9 +241,11 @@ def enrich_text_for_index(text: str) -> str:
         compact = re.sub(r"\D", "", match.group(0))
         if compact and compact not in extras:
             extras.append(compact)
-    compact_all = compact_digit_runs(value)
-    if compact_all != value and compact_all not in extras:
-        extras.append(compact_all)
+    # Add only compact identifiers/long digit sequences, not a duplicate of the entire page.
+    for match in re.finditer(r"(?<!\w)(?:\d[\s-]*){8,}\d(?!\w)", value):
+        compact = re.sub(r"\D", "", match.group(0))
+        if len(compact) >= 8 and compact not in extras:
+            extras.append(compact)
     return value + ("\n" + " ".join(extras) if extras else "")
 
 
@@ -1177,7 +1179,8 @@ def _filter_relevant_evidence(
     )
     exact_fact_intent = bool(re.search(
         r"phone|mobile|contact|whatsapp|telephone|फोन|मोबाइल|संपर्क|व्हाट्सएप|"
-        r"email|e-mail|ईमेल|roll|enrollment|student\s*id|cgpa|gpa|date of birth|जन्म तिथि|\bdob\b",
+        r"email|e-mail|ईमेल|roll|enrollment|student\s*id|cgpa|gpa|date of birth|जन्म तिथि|\bdob\b|"
+        r"\b(my|mine|mera|meri|mere)\b.{0,25}\bnumber\b|(?:मेरा|मेरी|मेरे).{0,15}(?:नंबर|नम्बर)",
         question, re.IGNORECASE,
     ))
     filtered = []
@@ -1271,10 +1274,8 @@ def retrieve_with_recovery(
     groups = [initial]
     initial_relevant = _filter_relevant_evidence(initial, question)
     if initial_relevant:
-        return _rerank_candidates(
-            question, initial_relevant, max(top_k, RAG_CANDIDATE_K),
-            is_self=is_self, user_profile=user_profile,
-        )
+        # retrieve_context has already applied the configured ranking/reranking stage.
+        return initial_relevant
 
     logger.info("Retrieval evidence below threshold; running bounded query-rewrite recovery")
     for variant in _retrieval_query_variants(question):
@@ -1603,16 +1604,21 @@ def ingest_document(
                      AND metadata->>'filename' = %s""",
                 (str(user_id), filename),
             )
-        metadata = json.dumps({
-            "filename": filename,
-            "user_id": user_id,
-            "document_id": document_id,
-            "embedding_model": EMBEDDING_MODEL_NAME,
-            "chunking_version": CHUNKING_VERSION,
-            "chunk_size_tokens": CHUNK_SIZE_TOKENS,
-            "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
-        })
         for index, ((page_number, chunk), embedding) in enumerate(zip(chunk_records, embeddings)):
+            first_line = chunk.split("\n", 1)[0].strip()
+            heading = first_line if first_line.startswith("#") else None
+            metadata = json.dumps({
+                "filename": filename,
+                "user_id": user_id,
+                "document_id": document_id,
+                "embedding_model": EMBEDDING_MODEL_NAME,
+                "chunking_version": CHUNKING_VERSION,
+                "chunk_size_tokens": CHUNK_SIZE_TOKENS,
+                "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
+                "content_hash": content_fingerprint(chunk),
+                "heading": heading,
+                "page_number": page_number,
+            })
             cursor.execute(
                 """INSERT INTO document_chunks
                    (content, metadata, page_number, chunk_index, document_id, embedding, embedding_model)
