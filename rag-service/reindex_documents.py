@@ -82,7 +82,7 @@ def main() -> int:
         documents = cur.fetchall()
         cur.close()
         print(f"Embedding model: {EMBEDDING_MODEL_NAME}")
-        print(f"Chunk strategy: paragraph/token v2, target={CHUNK_SIZE_TOKENS}, overlap={CHUNK_OVERLAP_TOKENS}")
+        print(f"Chunk strategy: heading-paragraph-token-v3, target={CHUNK_SIZE_TOKENS}, overlap={CHUNK_OVERLAP_TOKENS}")
         print(f"Documents discovered: {len(documents)}; dry_run={args.dry_run}")
 
         for document_id, title, file_url, user_id, is_college_doc, college_id in documents:
