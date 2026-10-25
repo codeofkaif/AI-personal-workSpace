@@ -24,6 +24,36 @@ _GEMINI_CLIENT = None
 _GEMINI_LOCK = Lock()
 _SPARSE_MODEL = None
 _SPARSE_LOCK = Lock()
+_TOKENIZER = None
+_TOKENIZER_LOCK = Lock()
+
+
+class _TikTokenAdapter:
+    """Small adapter exposing the tokenizer API used by the existing chunker."""
+    def __init__(self, encoding):
+        self.encoding = encoding
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        return self.encoding.encode(text, disallowed_special=())
+
+    def decode(self, tokens, skip_special_tokens: bool = True):
+        return self.encoding.decode(list(tokens))
+
+
+def get_text_tokenizer():
+    """Return a bounded local tokenizer for chunk sizing without loading an ML model."""
+    global _TOKENIZER
+    if _TOKENIZER is None:
+        with _TOKENIZER_LOCK:
+            if _TOKENIZER is None:
+                try:
+                    import tiktoken
+                    encoding = tiktoken.get_encoding(os.getenv("CHUNK_TOKENIZER", "cl100k_base"))
+                    _TOKENIZER = _TikTokenAdapter(encoding)
+                except Exception:
+                    logger.warning("tiktoken is unavailable; chunk sizing will use a word-count fallback.")
+                    _TOKENIZER = False
+    return _TOKENIZER if _TOKENIZER is not False else None
 
 
 def _truthy(value: Optional[str], default: bool = False) -> bool:
@@ -67,6 +97,12 @@ def stable_generation_id(items: Sequence[Dict[str, Any]], model_name: str) -> st
     digest.update(b"|heading-paragraph-token-v3|")
     for item in items:
         digest.update(str(item.get("document_key", "")).encode("utf-8"))
+        digest.update(b"|")
+        digest.update(str(item.get("filename", "")).encode("utf-8"))
+        digest.update(b"|")
+        digest.update(str(item.get("page_number", 0)).encode("utf-8"))
+        digest.update(b"|")
+        digest.update(str(item.get("document_id", "")).encode("utf-8"))
         digest.update(b"|")
         digest.update(str(item.get("chunk_index", 0)).encode("utf-8"))
         digest.update(b"|")
@@ -192,14 +228,19 @@ def ensure_qdrant_collection() -> Dict[str, Any]:
         logger.info("Created Qdrant collection %s (model=%s, dimension=%s)", collection, model_name, dimension)
     info = client.get_collection(collection_name=collection)
     configured_vectors = info.config.params.vectors
-    dense_config = configured_vectors.get("dense") if isinstance(configured_vectors, dict) else configured_vectors
-    if dense_config is None or getattr(dense_config, "size", None) != dimension:
+    dense_config = configured_vectors.get("dense") if isinstance(configured_vectors, dict) else None
+    sparse_config = info.config.params.sparse_vectors
+    if (
+        not isinstance(configured_vectors, dict)
+        or dense_config is None
+        or getattr(dense_config, "size", None) != dimension
+        or sparse_config is None
+        or "sparse" not in sparse_config
+    ):
         raise RuntimeError(
-            f"Qdrant collection {collection!r} has an incompatible dense vector schema. "
-            "Use a new collection name and re-index all source documents; never mix embedding spaces."
+            f"Qdrant collection {collection!r} has an incompatible named dense/sparse schema. "
+            "Use a new versioned collection and re-index all source documents; never mix embedding spaces."
         )
-    if isinstance(configured_vectors, dict) and "dense" not in configured_vectors:
-        raise RuntimeError(f"Qdrant collection {collection!r} does not contain the required 'dense' named vector.")
     # Payload indexes make tenant/scope filters predictable as the collection grows.
     for field_name, field_schema in (
         ("user_id", models.PayloadSchemaType.INTEGER),
