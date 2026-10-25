@@ -375,7 +375,7 @@ def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
     return "\n\n".join(text for _, text in extract_pages_from_file(file_bytes, filename) if text)
 
 def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[int] = None) -> List[str]:
-    """Heading-aware, token-bounded chunks that repeat section context across chunk boundaries."""
+    """Heading-aware, token-bounded chunks with table-header preservation."""
     target = max(64, chunk_size or CHUNK_SIZE_TOKENS)
     overlap_tokens = max(0, min(overlap if overlap is not None else CHUNK_OVERLAP_TOKENS, target // 3))
     if RAG_VECTOR_BACKEND == "qdrant":
@@ -410,8 +410,52 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
         words = value.split()
         return [" ".join(words[i:i + max_tokens]) for i in range(0, len(words), step)]
 
-    # Markdown headers are separated from adjacent body text even when the source has
-    # only a single newline after a heading.
+    def split_table(value: str, max_tokens: int) -> Optional[List[str]]:
+        """Split long extracted tables by rows and repeat their header in each chunk."""
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        explicit_table = bool(lines and lines[0].upper() == "TABLE")
+        markdown_separator = next(
+            (index for index, line in enumerate(lines)
+             if "|" in line and re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", line)),
+            None,
+        )
+        if explicit_table:
+            rows = lines[1:]
+            if not rows:
+                return [value]
+            header_rows = rows[:1]
+            body_rows = rows[1:]
+            prefix = "TABLE\n"
+        elif markdown_separator is not None:
+            header_rows = lines[:markdown_separator + 1]
+            body_rows = lines[markdown_separator + 1:]
+            prefix = ""
+        else:
+            return None
+
+        header_text = "\n".join(header_rows)
+        current_rows = list(header_rows)
+        outputs: List[str] = []
+        for row in body_rows:
+            candidate_rows = current_rows + [row]
+            candidate = prefix + "\n".join(candidate_rows)
+            if len(current_rows) > len(header_rows) and size_of(candidate) > max_tokens:
+                outputs.append(prefix + "\n".join(current_rows))
+                current_rows = list(header_rows) + [row]
+            else:
+                current_rows = candidate_rows
+
+        if current_rows:
+            outputs.append(prefix + "\n".join(current_rows))
+        bounded: List[str] = []
+        for chunk in outputs:
+            if size_of(chunk) <= max_tokens:
+                bounded.append(chunk)
+            else:
+                bounded.extend(split_large(chunk, max_tokens))
+        return bounded or [value]
+
+    # Separate Markdown headers from adjacent body text, even without a blank line.
     prepared = re.sub(r"(?m)(^#{1,6}[^\n]+)\n", r"\1\n\n", text or "")
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", prepared) if part.strip()]
     section_stack: List[tuple[int, str]] = []
@@ -439,11 +483,9 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
 
         header = pending_heading
         header_size = size_of(header) if header else 0
-        # Reserve room for the section heading in each body chunk, bounded by the
-        # selected chunk target. If the header itself is too large, let the body stand alone.
         use_header = bool(header and header_size < max(16, target // 3))
         body_limit = max(32, target - header_size - 2) if use_header else target
-        body_pieces = split_large(part, body_limit)
+        body_pieces = split_table(part, body_limit) or split_large(part, body_limit)
         for body_piece in body_pieces:
             value = f"{header}\n{body_piece}".strip() if use_header else body_piece.strip()
             if value and size_of(value) <= target:
@@ -452,7 +494,6 @@ def chunk_text(text: str, chunk_size: Optional[int] = None, overlap: Optional[in
                 chunks.extend(split_large(value, target))
         pending_heading = header
 
-    # A document consisting only of a heading should still be searchable.
     if not chunks and pending_heading:
         chunks.extend(split_large(pending_heading, target))
     return [chunk for chunk in chunks if chunk.strip()]
