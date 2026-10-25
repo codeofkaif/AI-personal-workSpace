@@ -129,7 +129,7 @@ AIWorkPlace/
 - **Java Development Kit (JDK 21)**
 - **Maven** (v3.8+)
 - **Python** (v3.10+)
-- **PostgreSQL** (v14+ with `pgvector` extension)
+- **PostgreSQL** (v14+) for application and access-control metadata; **Qdrant** for the target dense/sparse vector index. The optional legacy pgvector backend remains available for rollback.
 - **Ollama** (for local LLM generation; model is configured in .env)
 
 ---
