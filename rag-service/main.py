@@ -1000,7 +1000,7 @@ def _ollama_model_available(models: Any, configured_model: str) -> bool:
 
 @app.get("/health")
 def health_check():
-    """Report database, exact generation-model, and optional OCR capability."""
+    """Report metadata DB, generator, embeddings/vector-store and OCR capability."""
     database_ok = False
     conn = get_db_connection()
     if conn is not None:
@@ -1022,34 +1022,46 @@ def health_check():
         if ollama_api_ok:
             configured_model_ok = _ollama_model_available(response.json().get("models", []), OLLAMA_MODEL)
     except Exception:
-        logger.exception("Ollama/model readiness check failed")
+        logger.warning("Ollama/model readiness check failed", exc_info=True)
+
+    vector_store_status: Dict[str, Any] = {"backend": RAG_VECTOR_BACKEND, "available": True}
+    if RAG_VECTOR_BACKEND == "qdrant":
+        try:
+            from vector_store import qdrant_health
+            vector_store_status.update(qdrant_health())
+        except Exception as exc:
+            vector_store_status.update({"available": False, "error": type(exc).__name__})
+            logger.warning("Qdrant health check failed", exc_info=True)
 
     tesseract_available = bool(shutil.which("tesseract")) if OCR_ENABLED else None
     warnings = []
+    if not database_ok:
+        warnings.append("PostgreSQL metadata database is unavailable.")
     if not ollama_api_ok:
-        warnings.append("Ollama API is unavailable.")
+        warnings.append("Ollama generation API is unavailable.")
     elif not configured_model_ok:
-        warnings.append(
-            f"Configured Ollama model '{OLLAMA_MODEL}' is not installed; run 'ollama pull {OLLAMA_MODEL}'."
-        )
+        warnings.append(f"Configured Ollama model '{OLLAMA_MODEL}' is not installed; run 'ollama pull {OLLAMA_MODEL}'.")
+    if RAG_VECTOR_BACKEND == "qdrant" and not vector_store_status.get("available", False):
+        warnings.append("Qdrant is unavailable; verify QDRANT_URL and that the service is running.")
+    if RAG_VECTOR_BACKEND == "qdrant" and not os.getenv("GEMINI_API_KEY", "").strip():
+        warnings.append("GEMINI_API_KEY is not configured; Gemini embedding requests will fail until set in local .env.")
     if OCR_ENABLED and not tesseract_available:
-        warnings.append(
-            "OCR is enabled but Tesseract is not installed; scanned/image-only PDFs will not be searchable."
-        )
+        warnings.append("OCR is enabled but Tesseract is not installed; scanned/image-only PDFs may not be searchable.")
 
-    # Missing OCR affects scanned files only; digital text files can still use RAG.
-    ready = database_ok and ollama_api_ok and configured_model_ok
+    ready = database_ok and ollama_api_ok and configured_model_ok and bool(vector_store_status.get("available", False))
     return {
         "status": "healthy" if ready else "degraded",
         "service": "RAG Service",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "checks": {
             "database": "up" if database_ok else "down",
             "ollama": "up" if ollama_api_ok else "down",
             "ollama_model": "available" if configured_model_ok else ("missing" if ollama_api_ok else "unknown"),
+            "vector_store": "up" if vector_store_status.get("available", False) else "down",
             "ocr": "available" if tesseract_available is True else ("missing" if OCR_ENABLED else "disabled"),
         },
         "configured_ollama_model": OLLAMA_MODEL,
+        "vector_store": vector_store_status,
         "embedding_model": EMBEDDING_MODEL_NAME,
         "embedding_dimension": EMBEDDING_DIMENSION,
         "embedding_loaded": _embedding_model is not None,
@@ -1065,8 +1077,9 @@ def ingest_document(
     user_id: Optional[int] = Form(None),
     document_id: Optional[int] = Form(None)
 ):
-    """Extract, chunk, batch-embed, then atomically replace the document's indexed chunks."""
+    """Parse and stage chunks, then atomically activate a complete Qdrant generation."""
     conn = None
+    cursor = None
     try:
         if user_id is None:
             raise HTTPException(status_code=400, detail="user_id is required for isolated document ingestion.")
@@ -1074,16 +1087,19 @@ def ingest_document(
         if not filename:
             raise HTTPException(status_code=400, detail="A filename is required.")
         suffix = os.path.splitext(filename)[1].lower()
-        if suffix not in {".pdf", ".docx", ".txt", ".md"}:
-            raise HTTPException(status_code=415, detail="Supported file types are PDF, DOCX, TXT, and MD.")
+        from document_parser import SUPPORTED_EXTENSIONS
+        if suffix not in SUPPORTED_EXTENSIONS:
+            raise HTTPException(
+                status_code=415,
+                detail=f"Unsupported file type '{suffix}'. Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}.",
+            )
         file_bytes = file.file.read()
         max_upload_bytes = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
         if len(file_bytes) > max_upload_bytes:
             raise HTTPException(status_code=413, detail="Uploaded file exceeds the configured size limit.")
-        logger.info("Ingesting %s (%s bytes) for user %s", filename, len(file_bytes), user_id)
+        logger.info("Ingesting %s (%s bytes) for user %s backend=%s", filename, len(file_bytes), user_id, RAG_VECTOR_BACKEND)
 
-        page_texts = extract_pages_from_file(file_bytes, filename)
-        page_texts = [(page, text) for page, text in page_texts if text.strip()]
+        page_texts = [(page, value) for page, value in extract_pages_from_file(file_bytes, filename) if value.strip()]
         if not page_texts:
             message = (
                 f"No readable text could be extracted from '{filename}'. "
@@ -1092,77 +1108,161 @@ def ingest_document(
             if suffix == ".pdf" and OCR_ENABLED and not shutil.which("tesseract"):
                 message += (
                     " OCR is enabled but Tesseract is missing. On macOS run 'brew install tesseract', "
-                    "verify the required language with 'tesseract --list-langs', restart the RAG service, "
-                    "and upload the file again."
+                    "verify required language packs with 'tesseract --list-langs', then upload again."
                 )
             elif suffix == ".pdf":
-                message += " If this is a scanned PDF, verify Tesseract and the required OCR language packs."
+                message += " If this is scanned, verify Tesseract and the required OCR language packs."
             raise HTTPException(status_code=422, detail=message)
+
         chunk_records = [
-            (page_number, chunk)
+            (int(page_number or 0), chunk)
             for page_number, page_text in page_texts
             for chunk in chunk_text(page_text)
         ]
         if not chunk_records:
             raise HTTPException(
                 status_code=422,
-                detail=f"No non-empty text chunks could be produced for '{filename}'; the document was not indexed."
+                detail=f"No non-empty text chunks could be produced for '{filename}'; the document was not indexed.",
             )
-
         clean_chunks = [chunk.replace("\x00", "").strip() for _, chunk in chunk_records]
-        embeddings = get_embeddings(clean_chunks)
+        if any(not chunk for chunk in clean_chunks):
+            raise HTTPException(status_code=422, detail="An empty chunk was detected; the document was not indexed.")
+
+        # Validate the caller's document ownership before spending embedding API quota.
         conn = get_db_connection()
         if conn is None:
-            raise HTTPException(status_code=503, detail="Database unavailable; document was not indexed.")
-        ensure_chunk_schema(conn)
-        cursor = conn.cursor()
-
-        # Verify that the authenticated backend user owns this document before deleting/replacing chunks.
+            raise HTTPException(status_code=503, detail="PostgreSQL metadata database is unavailable.")
+        is_college_doc = False
+        college_id = None
         if document_id is not None:
+            cursor = conn.cursor()
             cursor.execute(
-                "SELECT user_id, is_college_doc FROM documents WHERE id = %s FOR UPDATE",
-                (document_id,)
+                """
+                SELECT d.user_id, d.is_college_doc, d.college_id, u.college_id
+                FROM documents d LEFT JOIN users u ON u.id = d.user_id
+                WHERE d.id = %s
+                """,
+                (document_id,),
             )
             owner = cursor.fetchone()
             if not owner:
                 raise HTTPException(status_code=404, detail="Document record not found.")
             if int(owner[0]) != int(user_id):
                 raise HTTPException(status_code=403, detail="User does not own this document.")
-            if bool(owner[1]):
-                logger.info("Reindexing college-scoped document %s for owner %s", document_id, user_id)
+            is_college_doc = bool(owner[1])
+            college_id = owner[2] if owner[2] is not None else owner[3]
+            if is_college_doc and college_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="This college document has no verified college_id; fix its metadata before indexing.",
+                )
+            conn.commit()
+            cursor.close()
+            cursor = None
+
+        if RAG_VECTOR_BACKEND == "qdrant":
+            embeddings = get_embeddings(clean_chunks, titles=[filename] * len(clean_chunks))
+        else:
+            embeddings = get_embeddings(clean_chunks)
+
+        if RAG_VECTOR_BACKEND == "qdrant":
+            # Re-check ownership immediately before indexing. Metadata database remains the
+            # source of truth for permissions; Qdrant stores only the validated scope claims.
+            if document_id is not None:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT d.user_id, d.is_college_doc, d.college_id, u.college_id
+                    FROM documents d LEFT JOIN users u ON u.id = d.user_id
+                    WHERE d.id = %s FOR UPDATE OF d
+                    """,
+                    (document_id,),
+                )
+                owner = cursor.fetchone()
+                if not owner or int(owner[0]) != int(user_id):
+                    raise HTTPException(status_code=403, detail="Document ownership changed during indexing.")
+                is_college_doc = bool(owner[1])
+                college_id = owner[2] if owner[2] is not None else owner[3]
+                if is_college_doc and college_id is None:
+                    raise HTTPException(status_code=422, detail="College document has no verified college_id.")
+                cursor.close()
+                cursor = None
+
+            from vector_store import upsert_document_chunks
+            document_key = f"document:{document_id}" if document_id is not None else f"upload:{user_id}:{filename}"
+            qdrant_items = [
+                {
+                    "content": chunk,
+                    "filename": filename,
+                    "user_id": int(user_id),
+                    "document_id": document_id,
+                    "document_key": document_key,
+                    "college_id": int(college_id) if college_id is not None and is_college_doc else None,
+                    "is_college_doc": is_college_doc,
+                    "page_number": page_number,
+                    "chunk_index": index,
+                }
+                for index, (page_number, chunk) in enumerate(chunk_records)
+            ]
+            created = upsert_document_chunks(qdrant_items, embeddings)
+            conn.commit()
+            logger.info(
+                "Indexed %s Qdrant chunks for %s model=%s collection=%s",
+                created, filename, EMBEDDING_MODEL_NAME, os.getenv("QDRANT_COLLECTION_NAME", "configured collection"),
+            )
+            return IngestResponse(
+                success=True,
+                message=f"Document '{filename}' parsed and indexed successfully ({created} chunks, Gemini/Qdrant).",
+                document_id=str(document_id) if document_id is not None else None,
+                chunks_created=created,
+            )
+
+        # Legacy path is unchanged for deployments which explicitly keep pgvector.
+        ensure_chunk_schema(conn)
+        cursor = conn.cursor()
+        if document_id is not None:
+            cursor.execute(
+                "SELECT user_id, is_college_doc FROM documents WHERE id = %s FOR UPDATE",
+                (document_id,),
+            )
+            owner = cursor.fetchone()
+            if not owner:
+                raise HTTPException(status_code=404, detail="Document record not found.")
+            if int(owner[0]) != int(user_id):
+                raise HTTPException(status_code=403, detail="User does not own this document.")
             cursor.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
         else:
             cursor.execute(
                 """DELETE FROM document_chunks
                    WHERE document_id IS NULL AND metadata->>'user_id' = %s
                      AND metadata->>'filename' = %s""",
-                (str(user_id), filename)
+                (str(user_id), filename),
             )
-
         metadata = json.dumps({
             "filename": filename,
             "user_id": user_id,
             "document_id": document_id,
             "embedding_model": EMBEDDING_MODEL_NAME,
-            "chunking_version": "paragraph-token-v2",
+            "chunking_version": "heading-paragraph-token-v3",
             "chunk_size_tokens": CHUNK_SIZE_TOKENS,
-            "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS
+            "chunk_overlap_tokens": CHUNK_OVERLAP_TOKENS,
         })
         for index, ((page_number, chunk), embedding) in enumerate(zip(chunk_records, embeddings)):
             cursor.execute(
                 """INSERT INTO document_chunks
                    (content, metadata, page_number, chunk_index, document_id, embedding, embedding_model)
                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (chunk, metadata, page_number, index, document_id, embedding, EMBEDDING_MODEL_NAME)
+                (chunk, metadata, page_number, index, document_id, embedding, EMBEDDING_MODEL_NAME),
             )
         conn.commit()
         cursor.close()
+        cursor = None
         logger.info("Indexed %s chunks for %s using %s", len(clean_chunks), filename, EMBEDDING_MODEL_NAME)
         return IngestResponse(
             success=True,
             message=f"Document '{filename}' processed and indexed successfully ({len(clean_chunks)} chunks).",
             document_id=str(document_id) if document_id is not None else None,
-            chunks_created=len(clean_chunks)
+            chunks_created=len(clean_chunks),
         )
     except HTTPException:
         if conn:
@@ -1172,8 +1272,16 @@ def ingest_document(
         if conn:
             conn.rollback()
         logger.exception("Document ingestion failed")
-        raise HTTPException(status_code=500, detail="Document ingestion failed; the index transaction was rolled back.") from e
+        raise HTTPException(
+            status_code=500,
+            detail="Document ingestion failed; the active index was preserved where the storage backend supports staged replacement.",
+        ) from e
     finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
         if conn:
             conn.close()
 
